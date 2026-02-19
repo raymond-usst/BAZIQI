@@ -1,0 +1,460 @@
+/* =========================================
+   Training Dashboard Styles
+   ========================================= */
+
+:root {
+    --red: #e74c3c;
+    --red-glow: #ff6b6b;
+    --green: #27ae60;
+    --green-glow: #6bff6b;
+    --blue: #2980b9;
+    --blue-glow: #6bb5ff;
+    --bg-dark: #0f0f1a;
+    --bg-card: #181830;
+    --bg-glass: rgba(255, 255, 255, 0.04);
+    --text-primary: #e8e8e8;
+    --text-secondary: #8a8aaa;
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --accent: #6c5ce7;
+    --accent-glow: #a29bfe;
+    --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.5);
+    --radius: 12px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    background: var(--bg-dark);
+    background-image:
+        radial-gradient(ellipse at 10% 30%, rgba(108, 92, 231, 0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 90% 70%, rgba(39, 174, 96, 0.05) 0%, transparent 50%);
+    color: var(--text-primary);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+/* ---- Header ---- */
+#dash-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 24px;
+    background: rgba(0, 0, 0, 0.3);
+    border-bottom: 1px solid var(--border-subtle);
+    flex-shrink: 0;
+}
+
+#dash-header h1 {
+    font-size: 1.3rem;
+    font-weight: 900;
+    background: linear-gradient(135deg, var(--accent-glow), var(--blue-glow), var(--green-glow));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+#connection-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.status-dot.disconnected {
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+}
+
+.status-dot.connected {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+}
+
+.status-dot.connecting {
+    background: #f39c12;
+    box-shadow: 0 0 8px #f39c12;
+    animation: pulse 1s infinite;
+}
+
+#ws-url {
+    width: 200px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+}
+
+.btn {
+    padding: 5px 14px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    background: rgba(108, 92, 231, 0.2);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: all 0.2s;
+}
+
+.btn:hover {
+    background: rgba(108, 92, 231, 0.4);
+    transform: translateY(-1px);
+}
+
+/* ---- Dashboard Grid ---- */
+#dashboard {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1.2fr;
+    gap: 12px;
+    padding: 12px;
+    overflow: hidden;
+}
+
+/* ---- Panel ---- */
+.panel {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.panel-header h2 {
+    font-size: 0.95rem;
+    font-weight: 700;
+}
+
+.badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    padding: 2px 10px;
+    border-radius: 20px;
+    background: rgba(108, 92, 231, 0.15);
+    color: var(--accent-glow);
+    border: 1px solid rgba(108, 92, 231, 0.2);
+}
+
+/* ---- Board Panel ---- */
+#board-panel {
+    display: flex;
+    flex-direction: column;
+}
+
+#live-board-wrapper {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.2);
+    position: relative;
+    overflow: hidden;
+}
+
+#live-board {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 4px;
+    image-rendering: pixelated;
+}
+
+#game-meta {
+    display: flex;
+    gap: 16px;
+    padding: 8px 16px;
+    font-size: 0.8rem;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text-secondary);
+    border-top: 1px solid var(--border-subtle);
+}
+
+/* ---- Right Column ---- */
+#right-column {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+}
+
+/* ---- Top Stats Row (Win Rates + Placement) ---- */
+#top-stats-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    flex-shrink: 0;
+}
+
+/* ---- Charts Grid (Loss + Scores side by side) ---- */
+#charts-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+}
+
+#charts-grid .panel {
+    min-height: 0;
+}
+
+/* ---- Win Rate Panel ---- */
+#winrate-panel {
+    flex-shrink: 0;
+}
+
+#winrate-bars {
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.wr-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.wr-label {
+    width: 60px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+.wr-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+}
+
+.wr-dot.red {
+    background: var(--red);
+}
+
+.wr-dot.green {
+    background: var(--green);
+}
+
+.wr-dot.blue {
+    background: var(--blue);
+}
+
+.wr-dot.draw {
+    background: #888;
+}
+
+.wr-bar-bg {
+    flex: 1;
+    height: 18px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 9px;
+    overflow: hidden;
+}
+
+.wr-bar {
+    height: 100%;
+    border-radius: 9px;
+    transition: width 0.6s ease;
+    min-width: 0;
+}
+
+.red-bar {
+    background: linear-gradient(90deg, var(--red), var(--red-glow));
+}
+
+.green-bar {
+    background: linear-gradient(90deg, var(--green), var(--green-glow));
+}
+
+.blue-bar {
+    background: linear-gradient(90deg, var(--blue), var(--blue-glow));
+}
+
+.draw-bar {
+    background: linear-gradient(90deg, #666, #999);
+}
+
+.wr-pct {
+    width: 45px;
+    text-align: right;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    font-weight: 600;
+}
+
+/* ---- Placement Distribution Panel ---- */
+#placement-panel {
+    flex-shrink: 0;
+}
+
+#placement-grid {
+    padding: 8px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+}
+
+.plc-header,
+.plc-row {
+    display: grid;
+    grid-template-columns: 58px repeat(3, 1fr) 1fr;
+    gap: 4px;
+    align-items: center;
+    padding: 3px 0;
+}
+
+.plc-header {
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    border-bottom: 1px solid var(--border-subtle);
+    padding-bottom: 5px;
+    margin-bottom: 2px;
+}
+
+.plc-header span {
+    text-align: center;
+}
+
+.plc-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 600;
+    font-size: 0.78rem;
+}
+
+.plc-val {
+    text-align: center;
+    color: var(--text-primary);
+    padding: 2px 4px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.plc-avg {
+    color: var(--accent-glow);
+    font-weight: 600;
+    background: rgba(108, 92, 231, 0.1);
+}
+
+/* ---- Bottom Charts Grid (Stats + ELO side by side) ---- */
+#bottom-charts-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+}
+
+#bottom-charts-grid .panel {
+    min-height: 0;
+}
+
+/* ---- Chart Panels ---- */
+#loss-panel,
+#scores-panel,
+#stats-panel,
+#elo-panel {
+    flex: 1;
+    min-height: 0;
+}
+
+.chart-container {
+    flex: 1;
+    padding: 8px 12px;
+    min-height: 0;
+    position: relative;
+}
+
+.chart-container canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
+
+/* ---- Footer ---- */
+#summary-bar {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 6px 24px;
+    background: rgba(0, 0, 0, 0.4);
+    border-top: 1px solid var(--border-subtle);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+/* ---- Animations ---- */
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.4;
+    }
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 1100px) {
+    #top-stats-row {
+        grid-template-columns: 1fr;
+    }
+
+    #charts-grid,
+    #bottom-charts-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 900px) {
+    #dashboard {
+        grid-template-columns: 1fr;
+        overflow-y: auto;
+    }
+
+    #board-panel {
+        min-height: 400px;
+    }
+
+    #top-stats-row {
+        grid-template-columns: 1fr;
+    }
+
+    #charts-grid,
+    #bottom-charts-grid {
+        grid-template-columns: 1fr;
+    }
+}

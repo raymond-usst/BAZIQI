@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>八子棋 - 三人对弈</title>
+    <meta name="description" content="八子棋：红绿蓝三人对弈，100×100木质棋盘，连续8子获胜">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700;900&family=Inter:wght@400;600;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header id="game-header">
+            <h1>八子棋</h1>
+            <p class="subtitle">红 · 绿 · 蓝 三人对弈 · 100×100 木质棋盘</p>
+        </header>
+
+        <!-- Game Mode Selector -->
+        <div id="mode-bar">
+            <div id="mode-selector">
+                <button class="mode-btn active" id="btn-mode-pvp" data-mode="pvp">👥 三人对弈</button>
+                <button class="mode-btn" id="btn-mode-ai" data-mode="ai">🤖 人机对战</button>
+            </div>
+            <div id="ai-options" class="hidden">
+                <label>你的颜色:</label>
+                <select id="human-color">
+                    <option value="red">🔴 红方</option>
+                    <option value="green">🟢 绿方</option>
+                    <option value="blue">🔵 蓝方</option>
+                </select>
+                <span id="ai-status" class="ai-status disconnected">● AI 未连接</span>
+                <button id="btn-connect-ai" class="ctrl-btn">连接AI</button>
+            </div>
+        </div>
+
+        <!-- Game Info Bar -->
+        <div id="info-bar">
+            <div id="player-panels">
+                <div class="player-panel" id="panel-red" data-player="red">
+                    <div class="player-indicator red-bg"></div>
+                    <div class="player-info">
+                        <span class="player-name">红方</span>
+                        <span class="player-stat">最长连子: <strong id="stat-red">0</strong></span>
+                    </div>
+                </div>
+                <div class="player-panel" id="panel-green" data-player="green">
+                    <div class="player-indicator green-bg"></div>
+                    <div class="player-info">
+                        <span class="player-name">绿方</span>
+                        <span class="player-stat">最长连子: <strong id="stat-green">0</strong></span>
+                    </div>
+                </div>
+                <div class="player-panel" id="panel-blue" data-player="blue">
+                    <div class="player-indicator blue-bg"></div>
+                    <div class="player-info">
+                        <span class="player-name">蓝方</span>
+                        <span class="player-stat">最长连子: <strong id="stat-blue">0</strong></span>
+                    </div>
+                </div>
+            </div>
+            <div id="turn-display">
+                <span>当前回合:</span>
+                <div class="turn-indicator" id="turn-indicator"></div>
+                <span id="turn-label">红方</span>
+                <span id="move-count" class="move-count">第 1 手</span>
+            </div>
+            <div id="controls">
+                <button id="btn-undo" class="ctrl-btn" title="悔棋">↩ 悔棋</button>
+                <button id="btn-restart" class="ctrl-btn" title="重新开始">🔄 重新开始</button>
+                <button id="btn-zoom-in" class="ctrl-btn" title="放大">🔍+</button>
+                <button id="btn-zoom-out" class="ctrl-btn" title="缩小">🔍-</button>
+                <button id="btn-minimap" class="ctrl-btn active" title="小地图">🗺️</button>
+            </div>
+        </div>
+
+        <!-- Board Container -->
+        <div id="board-wrapper">
+            <div id="board-viewport">
+                <canvas id="game-board"></canvas>
+            </div>
+            <!-- Minimap -->
+            <div id="minimap-container">
+                <canvas id="minimap"></canvas>
+                <div id="minimap-viewport-rect"></div>
+            </div>
+        </div>
+
+        <!-- Coordinates Display -->
+        <div id="coords-display">
+            <span id="hover-coords">坐标: -</span>
+        </div>
+
+        <!-- AI Thinking Indicator -->
+        <div id="ai-thinking" class="hidden">
+            <div class="thinking-spinner"></div>
+            <span>AI 思考中...</span>
+        </div>
+
+        <!-- Winner Modal -->
+        <div id="winner-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-glow"></div>
+                <h2 id="winner-title">🏆 游戏结束</h2>
+                <div id="ranking-list"></div>
+                <button id="btn-new-game" class="btn-primary">开始新游戏</button>
+            </div>
+        </div>
+    </div>
+    <script src="game.js"></script>
+</body>
+
+</html>

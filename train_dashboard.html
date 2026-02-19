@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>八子棋 MuZero - 训练监控台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=JetBrains+Mono:wght@400;600&display=swap"
+        rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="train_dashboard.css">
+</head>
+
+<body>
+    <!-- Header -->
+    <header id="dash-header">
+        <h1>🧠 MuZero 训练监控台</h1>
+        <div id="connection-bar">
+            <span id="ws-status" class="status-dot disconnected"></span>
+            <span id="ws-label">未连接</span>
+            <input id="ws-url" type="text" value="ws://localhost:5001" />
+            <button id="btn-connect" class="btn">连接</button>
+        </div>
+    </header>
+
+    <main id="dashboard">
+        <!-- Left Column: Live Board -->
+        <section id="board-panel" class="panel">
+            <div class="panel-header">
+                <h2>🎮 实时自对弈</h2>
+                <span id="board-info" class="badge">等待中...</span>
+            </div>
+            <div id="live-board-wrapper">
+                <canvas id="live-board"></canvas>
+            </div>
+            <div id="game-meta">
+                <span id="game-step">步数: 0</span>
+                <span id="game-player">当前: -</span>
+                <span id="game-iter">Iteration: -</span>
+            </div>
+        </section>
+
+        <!-- Right Column: Charts + Win Rates -->
+        <div id="right-column">
+            <!-- Top Row: Win Rates + Placement Distribution -->
+            <div id="top-stats-row">
+                <!-- Win Rates -->
+                <section id="winrate-panel" class="panel">
+                    <div class="panel-header">
+                        <h2>📊 累计胜率</h2>
+                        <span id="total-games" class="badge">0 局</span>
+                    </div>
+                    <div id="winrate-bars">
+                        <div class="wr-row">
+                            <div class="wr-label"><span class="wr-dot red"></span>红方</div>
+                            <div class="wr-bar-bg">
+                                <div class="wr-bar red-bar" id="wr-red" style="width:0%"></div>
+                            </div>
+                            <span class="wr-pct" id="wr-red-pct">0%</span>
+                        </div>
+                        <div class="wr-row">
+                            <div class="wr-label"><span class="wr-dot green"></span>绿方</div>
+                            <div class="wr-bar-bg">
+                                <div class="wr-bar green-bar" id="wr-green" style="width:0%"></div>
+                            </div>
+                            <span class="wr-pct" id="wr-green-pct">0%</span>
+                        </div>
+                        <div class="wr-row">
+                            <div class="wr-label"><span class="wr-dot blue"></span>蓝方</div>
+                            <div class="wr-bar-bg">
+                                <div class="wr-bar blue-bar" id="wr-blue" style="width:0%"></div>
+                            </div>
+                            <span class="wr-pct" id="wr-blue-pct">0%</span>
+                        </div>
+                        <div class="wr-row">
+                            <div class="wr-label"><span class="wr-dot draw"></span>平局</div>
+                            <div class="wr-bar-bg">
+                                <div class="wr-bar draw-bar" id="wr-draw" style="width:0%"></div>
+                            </div>
+                            <span class="wr-pct" id="wr-draw-pct">0%</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Placement Distribution -->
+                <section id="placement-panel" class="panel">
+                    <div class="panel-header">
+                        <h2>🏆 名次分布</h2>
+                        <span id="placement-total" class="badge">0 局</span>
+                    </div>
+                    <div id="placement-grid">
+                        <div class="plc-header">
+                            <span></span><span>🥇冠军</span><span>🥈亚军</span><span>🥉季军</span><span>均分</span>
+                        </div>
+                        <div class="plc-row">
+                            <span class="plc-label"><span class="wr-dot red"></span>红方</span>
+                            <span class="plc-val" id="plc-1-0">0</span>
+                            <span class="plc-val" id="plc-1-1">0</span>
+                            <span class="plc-val" id="plc-1-2">0</span>
+                            <span class="plc-val plc-avg" id="plc-1-avg">0.0</span>
+                        </div>
+                        <div class="plc-row">
+                            <span class="plc-label"><span class="wr-dot green"></span>绿方</span>
+                            <span class="plc-val" id="plc-2-0">0</span>
+                            <span class="plc-val" id="plc-2-1">0</span>
+                            <span class="plc-val" id="plc-2-2">0</span>
+                            <span class="plc-val plc-avg" id="plc-2-avg">0.0</span>
+                        </div>
+                        <div class="plc-row">
+                            <span class="plc-label"><span class="wr-dot blue"></span>蓝方</span>
+                            <span class="plc-val" id="plc-3-0">0</span>
+                            <span class="plc-val" id="plc-3-1">0</span>
+                            <span class="plc-val" id="plc-3-2">0</span>
+                            <span class="plc-val plc-avg" id="plc-3-avg">0.0</span>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Charts Grid (2x1) -->
+            <div id="charts-grid">
+                <!-- Loss Chart -->
+                <section id="loss-panel" class="panel">
+                    <div class="panel-header">
+                        <h2>📉 损失曲线</h2>
+                        <span id="current-loss" class="badge">-</span>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="loss-chart"></canvas>
+                    </div>
+                </section>
+
+                <!-- Session Scores Chart -->
+                <section id="scores-panel" class="panel">
+                    <div class="panel-header">
+                        <h2>🏅 累计积分曲线</h2>
+                        <span id="session-info" class="badge">会话: -</span>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="scores-chart"></canvas>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Bottom Charts Grid (Stats + ELO) -->
+            <div id="bottom-charts-grid">
+                <!-- Game Stats Chart -->
+                <section id="stats-panel" class="panel">
+                    <div class="panel-header">
+                        <h2>📈 训练指标</h2>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="stats-chart"></canvas>
+                    </div>
+                </section>
+
+                <!-- ELO Rating Chart -->
+                <section id="elo-panel" class="panel">
+                    <div class="panel-header">
+                        <h2>⚡ ELO 等级分</h2>
+                        <span id="elo-badge" class="badge">1500 / 1500 / 1500</span>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="elo-chart"></canvas>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </main>
+
+    <!-- Training Summary Bar -->
+    <footer id="summary-bar">
+        <span id="sum-step">Step: 0</span>
+        <span id="sum-iter">Iteration: 0</span>
+        <span id="sum-lr">LR: -</span>
+        <span id="sum-buf">Buffer: 0</span>
+        <span id="sum-session">会话: -</span>
+        <span id="sum-elo">ELO: -</span>
+        <span id="sum-time">运行时间: 0min</span>
+    </footer>
+
+    <script src="train_dashboard.js"></script>
+</body>
+
+</html>
