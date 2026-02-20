@@ -38,7 +38,9 @@
     let humanColor = 'red';       // which color the human plays
     let aiConnected = false;
     let aiThinking = false;
-    const AI_SERVER = 'http://localhost:5000';
+    let aiWebSocket = null;
+    const AI_SERVER_WS = 'ws://localhost:5000/api/ws/move';
+    const AI_SERVER_HTTP = 'http://localhost:5000/api/status';
     const PLAYER_TO_ID = { red: 1, green: 2, blue: 3 };
 
     // Zoom & Pan
@@ -134,7 +136,7 @@
             if (gameMode === 'ai' && PLAYERS[currentPlayerIdx] !== humanColor) return;
             const pos = screenToBoard(e.clientX, e.clientY);
             if (pos && board[pos.row][pos.col] === null) {
-                placePiece(pos.row, pos.col);
+                commitMove(pos.row, pos.col, true);
             }
         });
 
@@ -207,7 +209,7 @@
                 const touch = e.changedTouches[0];
                 const pos = screenToBoard(touch.clientX, touch.clientY);
                 if (pos && !gameOver && (board[pos.row][pos.col] === null)) {
-                    placePiece(pos.row, pos.col);
+                    commitMove(pos.row, pos.col, true);
                 }
             }
             isTouchPanning = false;
@@ -324,7 +326,8 @@
     }
 
     // ---- Game Logic ----
-    function placePiece(row, col) {
+    function commitMove(row, col, isHuman = false) {
+        if (gameOver) return;
         const player = PLAYERS[currentPlayerIdx];
         board[row][col] = player;
         moveHistory.push({ row, col, player });
@@ -349,7 +352,9 @@
         renderMinimap();
         updateMinimapViewport();
 
-        // Trigger AI turn if in AI mode
+        // Trigger AI turn if in AI mode. Also protect against infinite loop
+        // by only automatically triggering AI turns if a human initiated it, or
+        // if the recursive call detects it is an AI turn.
         if (gameMode === 'ai' && !gameOver) {
             processAITurns();
         }
@@ -821,7 +826,7 @@
     async function checkAIConnection() {
         const statusEl = document.getElementById('ai-status');
         try {
-            const resp = await fetch(`${AI_SERVER}/api/status`, { signal: AbortSignal.timeout(3000) });
+            const resp = await fetch(AI_SERVER_HTTP, { signal: AbortSignal.timeout(3000) });
             if (resp.ok) {
                 const data = await resp.json();
                 aiConnected = true;
@@ -849,71 +854,67 @@
 
         aiThinking = true;
         showThinking(true);
+        if (aiWebSocket) {
+            aiWebSocket.close();
+        }
 
-        try {
-            const boardData = getBoardForAPI();
-            const currentPid = PLAYER_TO_ID[PLAYERS[currentPlayerIdx]];
-
-            const resp = await fetch(`${AI_SERVER}/api/move`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+        return new Promise((resolve) => {
+            aiWebSocket = new WebSocket(AI_SERVER_WS);
+            
+            aiWebSocket.onopen = () => {
+                const boardData = getBoardForAPI();
+                const currentPid = PLAYER_TO_ID[PLAYERS[currentPlayerIdx]];
+                aiWebSocket.send(JSON.stringify({
                     board: boardData,
                     current_player: currentPid,
                     move_history: moveHistory.map(m => [m.row, m.col, PLAYER_TO_ID[m.player]]),
-                }),
-                signal: AbortSignal.timeout(30000),
-            });
+                }));
+            };
 
-            if (!resp.ok) {
-                throw new Error(`AI server error: ${resp.status}`);
-            }
+            aiWebSocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'progress') {
+                    // Update thinking indicator text
+                    const el = document.getElementById('ai-thinking');
+                    el.textContent = '🧠 ' + data.message;
+                } else if (data.type === 'result') {
+                    aiThinking = false;
+                    showThinking(false);
+                    if (data.row >= 0 && data.row < BOARD_SIZE &&
+                        data.col >= 0 && data.col < BOARD_SIZE &&
+                        board[data.row][data.col] === null) {
+                        commitMove(data.row, data.col);
+                    } else {
+                        console.warn('AI returned invalid move, picking random');
+                        placeRandomMove();
+                    }
+                    resolve();
+                } else if (data.error) {
+                    console.error('AI error:', data.error);
+                    aiThinking = false;
+                    showThinking(false);
+                    placeRandomMove();
+                    resolve();
+                }
+            };
 
-            const data = await resp.json();
-
-            // Validate and place the AI move
-            if (data.row >= 0 && data.row < BOARD_SIZE &&
-                data.col >= 0 && data.col < BOARD_SIZE &&
-                board[data.row][data.col] === null) {
-                placePieceInternal(data.row, data.col);
-            } else {
-                console.warn('AI returned invalid move, picking random');
+            aiWebSocket.onerror = (error) => {
+                console.error('WebSocket Error:', error);
+                aiThinking = false;
+                showThinking(false);
                 placeRandomMove();
-            }
-        } catch (e) {
-            console.error('AI move request failed:', e);
-            // Fallback: random move so game continues
-            placeRandomMove();
-        } finally {
-            aiThinking = false;
-            showThinking(false);
-        }
-    }
+                resolve();
+            };
 
-    function placePieceInternal(row, col) {
-        // Same as placePiece but without re-triggering AI (to avoid recursion issues)
-        const player = PLAYERS[currentPlayerIdx];
-        board[row][col] = player;
-        moveHistory.push({ row, col, player });
-        moveCount++;
-
-        const maxChain = getMaxChainAt(row, col, player);
-        recalcStats();
-
-        if (maxChain >= WIN_LENGTH) {
-            winner = player;
-            gameOver = true;
-            render();
-            renderMinimap();
-            showGameOverModal();
-            return;
-        }
-
-        currentPlayerIdx = (currentPlayerIdx + 1) % 3;
-        updateUI();
-        render();
-        renderMinimap();
-        updateMinimapViewport();
+            aiWebSocket.onclose = () => {
+                if (aiThinking) {
+                    aiThinking = false;
+                    showThinking(false);
+                    placeRandomMove();
+                    resolve();
+                }
+            };
+        });
     }
 
     function placeRandomMove() {
@@ -926,7 +927,7 @@
                     if (Math.abs(dr) !== dist && Math.abs(dc) !== dist) continue;
                     const r = center.row + dr, c = center.col + dc;
                     if (r >= 0 && r < BOARD_SIZE && c >= 0 && c < BOARD_SIZE && board[r][c] === null) {
-                        placePieceInternal(r, c);
+                        commitMove(r, c);
                         return;
                     }
                 }
@@ -936,7 +937,7 @@
         for (let r = 0; r < BOARD_SIZE; r++) {
             for (let c = 0; c < BOARD_SIZE; c++) {
                 if (board[r][c] === null) {
-                    placePieceInternal(r, c);
+                    commitMove(r, c);
                     return;
                 }
             }
