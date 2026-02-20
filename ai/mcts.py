@@ -59,14 +59,11 @@ class MCTSNode:
         self.virtual_loss = 0  # Temporary penalty during batch leaf collection
 
     def value(self) -> np.ndarray:
-        if self.visit_count == 0 and self.virtual_loss == 0:
+        if self.visit_count == 0:
             return np.zeros(3, dtype=np.float32)
-        total = self.visit_count + self.virtual_loss
-        # Virtual losses penalize the "current player's" value
-        # But for vector value, it's ambiguous.
-        # We assume virtual loss is handled via UCB/backup logic or just scalar penalty on selection.
-        # For simple mean:
-        return self.value_sums / total
+        # Virtual losses are applied as penalties during selection, 
+        # not by biasing the expected value artificially.
+        return self.value_sums / self.visit_count
 
 
 # ============================================================
@@ -325,63 +322,18 @@ def _batch_simulate_phase(root: MCTSNode, sim_queue: List[Tuple[int, 'MCTSNode']
 
             # 5. Backpropagate non-expandable leaves
             for li, search_path, value_est in no_expand:
-                # Value_est for non-expanded could be scalar (reward) or vector (value).
-                # If reward (scalar), we need to vectorise it.
-                # If leaf_node has value(), it is vector.
-                # But here `no_expand` logic passed `val`.
-                # Logic: `val = leaf_node.reward` OR `leaf_node.value()`.
-                # If reward: scalar. We need [r, 0, 0]? OR [r, -r, -r]?
-                # Actually, terminal reward comes from Environment which gives +/- 1.
-                # The environment `step` returns reward for CURRENT player.
-                # But we need [R0, R1, R2].
-                # This suggests `MCTS` needs to know full reward vector?
-                # Currently `MCTSNode.reward` is float.
-                # `game.step` returns float.
-                # If terminal, we have `placement_rewards` in GameHistory, but simpler here:
-                # We assume zero-sum-ish or use the scalar reward for the moving player?
-                # Note: `leaf_node.reward` is the immediate reward received by parent moving to leaf.
-                # Parent was turn `(d-1)%3`. Leaf is `d`.
-                # Reward is for Parent.
-                pass 
-                
-                # To fix correctly: `value_est` should be vector.
-                # If `leaf_node.expanded` and `visit_count > 0`, it returns vector.
-                # If `visit_count == 0`, we used `leaf_node.reward`.
-                # We need to construct a vector for reward. 
-                # If reward > 0 (win), we can infer others? 
-                # Or just assign to current player component?
-                # Let's handle `no_expand` logic better:
-                
                 real_val = value_est
-                if np.isscalar(real_val):
-                    # Construct vector: 
-                    # reward is for player `(len(path)-2)%3`? 
-                    # Node stores reward from incoming transition.
-                    # Transition was from Parent (Depth D-1) -> Child (D).
-                    # Parent was P_prev.
-                    # Reward is for P_prev.
-                    # So vector has `real_val` at `(leaf_len-2)%3`.
-                    # But strictly, intermediate rewards are 0 usually.
-                    # Terminal rewards: `leaf_node.reward` used?
-                    # If this scalar logic is too complex to patch here, 
-                    # I will accept a TODO or simplifying assumption that `no_expand` 
-                    # uses existing vector if available.
-                    # But `no_expand` handles terminal/visited nodes.
-                    # Re-read `no_expand` definition:
-                    # `val = leaf_node.reward` (scalar)
-                    # `val = leaf_node.value()` (vector)
-                    
-                    if not isinstance(real_val, np.ndarray):
-                        # Scalar reward case (rare if intermediate 0)
-                        # Assume it rewards the player who moved (Parent).
-                        p_idx = (len(search_path) - 2) % 3
-                        # Construct vector?
-                        v = np.zeros(3, dtype=np.float32)
-                        v[p_idx] = real_val
-                        # Opponents get -val? Standard zero-sum logic for reward?
-                        # Or if reward=1, others -1.
-                        # We'll assume simple:
-                        real_val = v 
+                if np.isscalar(real_val) or (isinstance(real_val, np.ndarray) and real_val.size == 1):
+                    # Scalar reward case: Construct zero-sum vector for the player who moved
+                    v = np.zeros(3, dtype=np.float32)
+                    p_idx = (len(search_path) - 2) % num_players
+                    v[p_idx] = float(real_val)
+                    if num_players > 1:
+                        v_other = -float(real_val) / (num_players - 1)
+                        for i in range(num_players):
+                            if i != p_idx:
+                                v[i] = v_other
+                    real_val = v 
 
                 _remove_virtual_loss(search_path)
                 _backpropagate(search_path, real_val, config.discount,
@@ -485,11 +437,17 @@ def _ucb_score(parent: MCTSNode, child: MCTSNode, total_visits: int,
     pb_c = math.log((total_visits + config.pb_c_base + 1) / config.pb_c_base) + config.pb_c_init
     prior_score = pb_c * child.prior * math.sqrt(total_visits) / (1 + effective_visits)
 
-    if effective_visits > 0:
-        # Select component for the current player
+    if child.visit_count > 0:
         v_vec = child.value() # [V0, V1, V2] absolute
         v_scalar = v_vec[turn]
-        value_score = min_max.normalize(child.reward + config.discount * v_scalar)
+    else:
+        v_scalar = 0.0
+
+    if effective_visits > 0:
+        # Apply virtual loss penalty: Treat virtual loss as a -1.0 return
+        vl_penalty = (child.virtual_loss / effective_visits) * config.discount
+        q_value = child.reward + config.discount * v_scalar - vl_penalty
+        value_score = min_max.normalize(q_value)
     else:
         value_score = 0.0
 
@@ -514,32 +472,10 @@ def _backpropagate(search_path: List[MCTSNode], value: np.ndarray,
     for i, node in enumerate(reversed(search_path)):
         node.value_sums += value
         node.visit_count += 1
-        
-        # MinMaxStats update: we need the scalar value relevant to the player 
-        # who would be CHOOSING at this node's parent? 
-        # Or rather, the value used for UCB at this node.
-        # This node represents a state S. 
-        # If we are at this node, we are evaluating children.
-        # But MinMaxStats is usually global for the tree.
-        # In multi-player, values for different players might be in different ranges 
-        # (though here all are [-1, 1] or [0, 1]).
-        # Standard: update with the value of the player whose turn it is at the PARENT 
-        # (who selected this node).
-        # Depth of node is `len(search_path) - 1 - i`.
-        # Actually simplest is to just update with the component relevant to the player at this node?
-        # No, MinMax normalizes Q for selection. Selection happens at Parent.
-        # Parent (Turn T) chooses Node. Parent cares about V[T].
-        # So we update MinMax with V[T].
-        # But we don't pass parent turn here easily?
-        # Actually, `node` stores state S.
-        # The value of S is V(S).
-        # The player moving at S (Turn T) wants to maximize V[T](Child).
-        # So min_max should track the range of V[T].
-        # Since all V are in same range, we can just update with mean, or max?
-        # Let's update with `value[0]` just to track range is [-1, 1]?
-        # Or better, update with all components to ensure full range coverage.
-        min_max.update(np.min(value)) 
-        min_max.update(np.max(value))
+        # MinMaxStats update: tracking the root's perspective component (value[0])
+        # correctly establishes the plausible bounds of the value without
+        # corrupting the scale with the opposing players' potentially negative bounds.
+        min_max.update(value[0])
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:

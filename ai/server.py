@@ -7,11 +7,12 @@ import os
 import sys
 import torch
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
+import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -159,6 +160,117 @@ async def get_move(req: MoveRequest):
         except Exception:
             pass
         raise HTTPException(status_code=503, detail=f"Inference error: {type(e).__name__}")
+
+
+@app.websocket("/api/ws/move")
+async def websocket_move(websocket: WebSocket):
+    """WebSocket endpoint for AI moves. Yields progress updates while thinking."""
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        req = MoveRequest(**data)
+        
+        if network is None:
+            await websocket.send_json({"error": "Model not loaded"})
+            return
+            
+        if len(req.board) != 100 or any(len(row) != 100 for row in req.board):
+            await websocket.send_json({"error": "Board must be 100x100"})
+            return
+        if req.current_player not in (1, 2, 3):
+            await websocket.send_json({"error": "current_player must be 1, 2, or 3"})
+            return
+            
+        board_arr = np.array(req.board, dtype=np.int8)
+        if not np.all((board_arr >= 0) & (board_arr <= 3)):
+            await websocket.send_json({"error": "Board values must be 0-3"})
+            return
+
+        import time
+        t_start = time.time()
+
+        env = EightInARowEnv()
+        env.board = board_arr
+        player_idx = req.current_player - 1
+        env.current_player = player_idx
+        occupied = np.argwhere(env.board != 0)
+        if len(occupied) > 0:
+            env._min_r = int(occupied[:, 0].min())
+            env._max_r = int(occupied[:, 0].max())
+            env._min_c = int(occupied[:, 1].min())
+            env._max_c = int(occupied[:, 1].max())
+
+        obs, center = env.get_observation(config.local_view_size)
+        legal_mask = env.get_legal_actions_mask(center[0], center[1], config.local_view_size)
+        if legal_mask.sum() == 0:
+            await websocket.send_json({"error": "No legal moves available"})
+            return
+
+        network.eval()
+        
+        # Run search in a background thread to allow sending progress
+        loop = asyncio.get_running_loop()
+        search_task = loop.run_in_executor(
+            None,
+            lambda: gumbel_muzero_search(network, obs, legal_mask, config, add_noise=False)
+        )
+        
+        async def send_progress():
+            start_time = time.time()
+            while not search_task.done():
+                elapsed = time.time() - start_time
+                try:
+                    await websocket.send_json({"type": "progress", "message": f"Thinking... {elapsed:.1f}s"})
+                except Exception:
+                    break
+                await asyncio.sleep(0.5)
+                
+        progress_task = asyncio.create_task(send_progress())
+        
+        try:
+            action_probs, _root_value = await search_task
+        finally:
+            progress_task.cancel()
+
+        action = select_action(action_probs, temperature=0.1)
+        board_r, board_c = env.action_to_board(action, center[0], center[1], config.local_view_size)
+
+        if not (0 <= board_r < env.BOARD_SIZE and 0 <= board_c < env.BOARD_SIZE):
+            legal = env.legal_moves_local(center[0], center[1], config.local_view_size)
+            if len(legal) > 0:
+                board_r, board_c = legal[np.random.randint(len(legal))]
+        if env.board[board_r, board_c] != 0:
+            legal = env.legal_moves_local(center[0], center[1], config.local_view_size)
+            if len(legal) > 0:
+                board_r, board_c = legal[np.random.randint(len(legal))]
+
+        elapsed_ms = (time.time() - t_start) * 1000
+        confidence = float(action_probs[action]) if action < len(action_probs) else 0.0
+        root_value = _root_value.tolist() if hasattr(_root_value, 'tolist') else list(_root_value)
+        
+        top_indices = np.argsort(action_probs)[::-1][:3]
+        top_actions = []
+        for idx in top_indices:
+            r, c = env.action_to_board(int(idx), center[0], center[1], config.local_view_size)
+            top_actions.append({"row": int(r), "col": int(c), "prob": float(action_probs[idx])})
+
+        await websocket.send_json({
+            "type": "result",
+            "row": int(board_r),
+            "col": int(board_c),
+            "confidence": confidence,
+            "thinking_time_ms": round(elapsed_ms, 1),
+            "root_value": root_value,
+            "top_actions": top_actions
+        })
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        _log.error("WebSocket move failed: %s: %s", type(e).__name__, e)
+        try:
+            await websocket.send_json({"error": f"Inference error: {type(e).__name__}"})
+        except: pass
 
 
 def load_model(model_path: str, use_cuda: bool = True):

@@ -793,37 +793,56 @@ class ReplayBuffer:
     #  Persistence (backward-compatible)
     # ================================================================
 
-    _SAVE_VERSION = 2
+    _SAVE_VERSION = 3
 
     def save(self, path: str):
-        """Save buffer to disk (atomic: write to .tmp then replace)."""
-        tmp_path = path + '.tmp'
+        """Save buffer to disk using chunking to prevent memory/IO spikes."""
+        tmp_dir = path + '_chunks.tmp'
+        final_dir = path + '_chunks'
         try:
-            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+            os.makedirs(tmp_dir, exist_ok=True)
+            
+            chunk_size = 1000
+            num_chunks = (len(self.games) + chunk_size - 1) // chunk_size if self.games else 0
+            
+            for i in range(num_chunks):
+                start = i * chunk_size
+                end = min(len(self.games), start + chunk_size)
+                chunk_data = {
+                    'games': self.games[start:end],
+                    'meta': self.meta[start:end]
+                }
+                c_path = os.path.join(tmp_dir, f'chunk_{i}.pkl')
+                with open(c_path, 'wb') as f:
+                    pickle.dump(chunk_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
             data = {
                 'version': self._SAVE_VERSION,
-                'games': self.games,
-                'meta': self.meta,
+                'is_chunked': True,
+                'num_chunks': num_chunks,
                 'total_games': self.total_games,
                 'total_memory': self.total_memory,
                 'max_size': self.max_size,
                 '_eviction_count': self._eviction_count,
             }
-            with open(tmp_path, 'wb') as f:
+            with open(os.path.join(tmp_dir, 'meta.pkl'), 'wb') as f:
                 pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+                
+            # Rename atomic swap
+            import shutil
+            if os.path.exists(final_dir):
+                shutil.rmtree(final_dir, ignore_errors=True)
+            os.rename(tmp_dir, final_dir)
+            
+            # Legacy pointer
+            with open(path + '.tmp', 'wb') as f:
+                pickle.dump({'version': self._SAVE_VERSION, 'is_chunked': True, 'chunk_dir': final_dir}, f)
+            os.replace(path + '.tmp', path)
         except Exception as e:
-            _log.error("Failed to save: %s", e)
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+            _log.error("Failed to save chunked buffer: %s", e)
 
     def load(self, path: str):
-        """Load buffer from disk. Backward-compatible with old deque format."""
+        """Load buffer from disk. Backward-compatible with old formats."""
         try:
             with open(path, 'rb') as f:
                 data = pickle.load(f)
@@ -833,7 +852,9 @@ class ReplayBuffer:
 
         version = data.get('version', 1)
 
-        if version >= 2:
+        if data.get('is_chunked'):
+            self._load_chunked(data.get('chunk_dir', path + '_chunks'))
+        elif version >= 2:
             self._load_v2(data)
         else:
             self._load_v1_compat(data)
@@ -849,6 +870,56 @@ class ReplayBuffer:
               f"({report['total_memory_gb']:.2f} GB / {report['max_memory_gb']:.1f} GB, "
               f"{report['usage_pct']:.1f}%, avg_q={report['avg_quality']:.3f})",
               flush=True)
+
+    def _load_chunked(self, chunk_dir: str):
+        """Load from a chunked directory format."""
+        meta_path = os.path.join(chunk_dir, 'meta.pkl')
+        if not os.path.exists(meta_path):
+            _log.error("Chunk meta.pkl not found: %s", meta_path)
+            return
+            
+        with open(meta_path, 'rb') as f:
+            data = pickle.load(f)
+            
+        self.games = []
+        self.meta = []
+        skipped = 0
+        
+        for i in range(data.get('num_chunks', 0)):
+            c_path = os.path.join(chunk_dir, f'chunk_{i}.pkl')
+            if not os.path.exists(c_path):
+                _log.warning("Missing chunk %d", i)
+                continue
+            try:
+                with open(c_path, 'rb') as f:
+                    c_data = pickle.load(f)
+                for g in c_data.get('games', []):
+                    if not self._is_valid_game_entry(g):
+                        skipped += 1
+                        continue
+                    self.games.append(g)
+                for m in c_data.get('meta', []):
+                    self.meta.append(m)
+            except Exception as e:
+                 _log.error("Failed to load chunk %d: %s", i, e)
+
+        if skipped > 0:
+            print(f"[ReplayBuffer] Skipped {skipped} corrupted game entries.", flush=True)
+
+        self.total_games = data.get('total_games', len(self.games))
+        self.max_size = data.get('max_size', self.max_size)
+        self._eviction_count = data.get('_eviction_count', 0)
+        self._weights_dirty = True
+        
+        while len(self.meta) < len(self.games):
+            idx = len(self.meta)
+            self.meta.append({
+                'insert_idx': self.total_games - len(self.games) + idx,
+                'training_step': 0,
+                'memory_bytes': self._estimate_game_memory(self.games[idx]) if idx < len(self.games) else 0,
+                'quality': 0.5,
+                'timestamp': time.time()
+            })
 
     def _load_v2(self, data: Dict):
         """Load new format (version 2+). Only append entries that look like valid GameHistory."""

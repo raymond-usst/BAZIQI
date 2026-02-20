@@ -202,7 +202,10 @@ def train(config: MuZeroConfig, args):
             try:
                 print(f"Loading checkpoint: {ckpt_path}")
                 checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-                state_dict = checkpoint['network_state_dict']
+                state_dict = checkpoint.get('network_state_dict', checkpoint.get('model'))
+                if state_dict is None:
+                    raise KeyError("Checkpoint missing 'network_state_dict' or 'model' key")
+
                 model_dict = network.state_dict()
                 pretrained_dict = {k: v for k, v in state_dict.items()
                                   if k in model_dict and v.shape == model_dict[k].shape}
@@ -695,7 +698,7 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
             return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
                     'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, '_nan': True}
 
-        torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=getattr(config, 'max_grad_norm', 1.0))
+        torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=getattr(config, 'max_grad_norm', 10.0))
         scaler.step(optimizer)
         scaler.update()
 

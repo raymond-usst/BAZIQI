@@ -108,6 +108,8 @@ class PredictionNetwork(nn.Module):
         self.policy_row = nn.Linear(fc_hidden, self.view_size)   # 512 → 21
         self.policy_col = nn.Linear(fc_hidden, self.view_size)   # 512 → 21
 
+        self.support_size = 21 # Support set bins for values from -1 to 1 (-1.0, -0.9, ... 1.0)
+        self.register_buffer('value_support', torch.linspace(-1.0, 1.0, self.support_size))
         self.value_net = nn.Sequential(
             nn.Linear(hidden_state_dim, fc_hidden),
             nn.LayerNorm(fc_hidden),
@@ -115,8 +117,7 @@ class PredictionNetwork(nn.Module):
             nn.Linear(fc_hidden, fc_hidden),
             nn.LayerNorm(fc_hidden),
             nn.GELU(),
-            nn.Linear(fc_hidden, 3),
-            nn.Tanh(),
+            nn.Linear(fc_hidden, 3 * self.support_size),  # Categorical logits for 3 components
         )
         
         # Auxiliary Heads
@@ -138,9 +139,15 @@ class PredictionNetwork(nn.Module):
         col_logits = self.policy_col(x)   # (B, 21)
         policy_logits = row_logits.unsqueeze(2) + col_logits.unsqueeze(1)  # (B, 21, 21)
         policy_logits = policy_logits.reshape(B, -1)  # (B, 441)
+        
+        # Logit clipping to prevent FP16 exponential overflow and NaNs before sequence/softmax
+        policy_logits = torch.clamp(policy_logits, min=-10.0, max=10.0)
 
-        # Value path (uses separate representation)
-        value = self.value_net(value_repr).squeeze(-1)
+        # Value path using Support Set
+        value_logits = self.value_net(value_repr)
+        value_logits = value_logits.view(B, 3, self.support_size)
+        value_probs = F.softmax(value_logits, dim=-1)
+        value = (value_probs * self.value_support).sum(dim=-1) # (B, 3)
         
         # Aux path (use raw hidden state or policy repr? Use raw to force representation to encode it)
         threat_logits, opp_action_logits, heatmap_logits = self.aux_heads(hidden_state)

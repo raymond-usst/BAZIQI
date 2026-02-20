@@ -139,6 +139,81 @@ class SharedStats:
 
 # CurriculumScheduler removed in favor of CurriculumManager
 
+def buffer_loop(config, buffer_queue, batch_queue, cmd_queue, res_queue, stop_event, shared_buffer_games):
+    """Background process for maintaining the ReplayBuffer and sampling batches."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""  # No GPU needed
+    try:
+        from ai.replay_buffer import ReplayBuffer
+        from ai.data_augment import apply_board_augment
+        import numpy as np
+        
+        buffer = ReplayBuffer(
+            max_size=config.replay_buffer_size,
+            max_memory_gb=config.max_memory_gb,
+            priority_alpha=config.priority_alpha,
+            min_games=config.min_buffer_games
+        )
+
+        def batch_worker():
+            numpy_rng = np.random.default_rng()
+            while not stop_event.is_set():
+                try:
+                    if buffer.num_games() >= config.min_buffer_size:
+                        batch = buffer.sample_batch(
+                            config.batch_size, config.num_unroll_steps,
+                            config.td_steps, config.discount, config.policy_size
+                        )
+                        if getattr(config, 'augment_board', False):
+                            apply_board_augment(batch, numpy_rng, noise_std=getattr(config, 'augment_noise_std', 0.0) or None)
+                        batch_queue.put(batch, timeout=1.0)
+                    else:
+                        time.sleep(0.5)
+                except queue.Full:
+                    time.sleep(0.1)
+                except Exception as e:
+                    _log.error("[Buffer Thread] Error: %s", e)
+                    time.sleep(0.5)
+
+        bt = threading.Thread(target=batch_worker, daemon=True)
+        bt.start()
+
+        last_games_update = 0
+        while not stop_event.is_set():
+            for _ in range(50):
+                try:
+                    game, step = buffer_queue.get_nowait()
+                    buffer.save_game(game, training_step=step)
+                except queue.Empty:
+                    break
+            
+            while not cmd_queue.empty():
+                try:
+                    cmd = cmd_queue.get_nowait()
+                    cmd_type = cmd.get('type')
+                    if cmd_type == 'clear':
+                        buffer.clear()
+                        res_queue.put({'type': 'clear_ok'})
+                    elif cmd_type == 'load':
+                        buffer.load(cmd['path'])
+                        res_queue.put({'type': 'load_ok', 'num_games': buffer.num_games()})
+                    elif cmd_type == 'save':
+                        buffer.save(cmd['path'])
+                        res_queue.put({'type': 'save_ok', 'report': buffer.memory_report()})
+                    elif cmd_type == 'report':
+                        res_queue.put({'type': 'report_ok', 'report': buffer.memory_report()})
+                except queue.Empty:
+                    break
+            
+            now = time.time()
+            if now - last_games_update > 1.0:
+                shared_buffer_games.value = buffer.num_games()
+                last_games_update = now
+
+            time.sleep(0.01)
+    except Exception as e:
+        _log.error("[Buffer Process] Crash: %s", e)
+        traceback.print_exc()
+
 
 def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, shared_stats,
                live_queue=None, shared_model=None, weights_version=None, weights_lock=None, shared_curriculum_stage=None):
@@ -470,13 +545,26 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
         if config.use_engram:
             memory_bank = MemoryBank(config.memory_capacity, config.hidden_state_dim, config.hidden_state_dim)
 
-        # Buffer (memory-aware)
-        buffer = ReplayBuffer(
-            max_size=config.replay_buffer_size,
-            max_memory_gb=config.max_memory_gb,
-            priority_alpha=config.priority_alpha,
-            min_games=config.min_buffer_games
-        )
+        # Replay Buffer Process Setup
+        buffer_queue = mp.Queue(maxsize=1000)
+        batch_queue = mp.Queue(maxsize=16)
+        buffer_cmd_queue = mp.Queue()
+        buffer_res_queue = mp.Queue()
+        shared_buffer_games = mp.Value('i', 0)
+        
+        # Start buffer process
+        p_buffer = mp.Process(target=buffer_loop, args=(
+            config, buffer_queue, batch_queue, buffer_cmd_queue, buffer_res_queue, stop_event, shared_buffer_games
+        ))
+        p_buffer.start()
+        
+        def buffer_cmd_sync(cmd_dict, timeout=600):
+            buffer_cmd_queue.put(cmd_dict)
+            try:
+                return buffer_res_queue.get(timeout=timeout)
+            except Exception as e:
+                _log.error(f"Buffer cmd {cmd_dict} failed/timeout: {e}")
+                return None
 
         step = 0
         game_receive_count = 0
@@ -666,13 +754,13 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
 
                 # 3. Load Replay Buffer (replay_buffer.pkl)
                 buffer_path = os.path.join(config.checkpoint_dir, 'replay_buffer.pkl')
-                if os.path.exists(buffer_path):
-                    print(f"[Learner] Loading replay buffer from {buffer_path}...")
-                    try:
-                        buffer.load(buffer_path)
-                        print(f"[Learner] Replay buffer loaded. Games: {buffer.num_games()}")
-                    except Exception as e:
-                        _log.warning("[Learner] Failed to load replay buffer: %s (Starting with empty buffer)", e)
+                if os.path.exists(buffer_path) or os.path.exists(buffer_path + "_chunks") or os.path.exists(buffer_path + ".tmp"):
+                    print(f"[Learner] Telling Buffer Process to load replay buffer from {buffer_path}...")
+                    res = buffer_cmd_sync({'type': 'load', 'path': buffer_path})
+                    if res and res.get('type') == 'load_ok':
+                        print(f"[Learner] Replay buffer loaded. Games: {res.get('num_games')}")
+                    else:
+                        print("[Learner] Buffer Process failed to load replay buffer.")
                 else:
                     print(f"[Learner] Replay buffer not found. Starting with empty buffer.")
 
@@ -826,29 +914,17 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
         t_start = time.time()
         nan_streak = 0  # Consecutive NaN loss counter
 
-        # Async batch prefetcher: sample next batch on background thread while GPU trains (config.prefetch_workers)
+        # Async batch prefetcher: now simply pulls from batch_queue and pins tensors
         prefetcher = ThreadPoolExecutor(max_workers=config.prefetch_workers)
         pending_batch_future = None
 
         def _prefetch_batch():
-            """Sample a batch AND pre-convert to pinned tensors on background thread.
-            
-            This moves the expensive numpy→torch conversion + pin_memory off the
-            main thread so the GPU can overlap data transfer with computation.
-            """
-            raw = buffer.sample_batch(
-                config.batch_size, config.num_unroll_steps,
-                config.td_steps, config.discount, config.policy_size
-            )
-            if getattr(config, 'augment_board', False):
-                rng = np.random.default_rng()
-                apply_board_augment(raw, rng, noise_std=getattr(config, 'augment_noise_std', 0.0) or None)
-            # Pre-convert to pinned tensors (CPU-bound, safe from background thread)
+            """Fetch a pre-sampled batch from background process and pin to GPU."""
+            raw = batch_queue.get()
             pinned = {}
             for key, val in raw.items():
                 t = torch.from_numpy(val)
                 if device.type == 'cuda':
-                    # Efficiency: pin_memory for async DMA when moving to GPU.
                     t = t.pin_memory()
                 pinned[key] = t
             return pinned
@@ -887,7 +963,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 if curriculum.current_stage_idx > last_stage:
                     print(f"[Learner] Curriculum Advancement: Stage {last_stage} -> {curriculum.current_stage_idx}", flush=True)
                     print(f"[Learner] Clearing Replay Buffer to prevent stage mismatch...", flush=True)
-                    buffer.clear()
+                    buffer_cmd_sync({'type': 'clear'})
                     last_stage = curriculum.current_stage_idx
 
             # 1. Empty Queue
@@ -933,7 +1009,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                                 op_obj = LeagueOpponent("", o_dat['elo'], o_dat['step'], 0)
                                 league.record_match(op_obj, score)
 
-                    buffer.save_game(game, training_step=step)
+                    # Offload game storage to ReplayBuffer process
+                    buffer_queue.put((game, step))
                     game_receive_count += 1
                     
                     if memory_bank:
@@ -959,7 +1036,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
 
 
             # 2. Train
-            if buffer.num_games() < config.min_buffer_size:
+            if shared_buffer_games.value < config.min_buffer_size:
                 # Discard any pending prefetch — buffer state may have changed
                 pending_batch_future = None
 
@@ -969,7 +1046,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 time.sleep(1.0)
                 current_time = datetime.now().strftime("%H:%M:%S")
                 
-                count = buffer.num_games()
+                count = shared_buffer_games.value
                 elapsed = time.time() - start_wait_time
                 if count > 0 and elapsed > 1.0:
                     rate = count / elapsed  # games/sec
@@ -1236,7 +1313,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                         _log_learner.info("GRADUATING to Stage %s: %s", new_stage.stage_id, new_stage)
                          
                         # 1. Clear Buffer (Mandatory due to shape change)
-                        buffer.clear()
+                        buffer_cmd_sync({'type': 'clear'})
                         print("[Learner] Replay buffer cleared.", flush=True)
                         
                         # 2. Reset KOTH
@@ -1288,24 +1365,30 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 data = {
                     'step': step,
                     'model': _strip_compiled_prefix(model.state_dict()),
+                    'network_state_dict': _strip_compiled_prefix(model.state_dict()), # For cross-compatibility with train.py
                     'optimizer': optimizer.state_dict(),
                     'scaler': scaler.state_dict(),
                     'stats': shared_stats.get_info(),
                     'curriculum_state': curriculum.state_dict(),
-                    'league_current_elo': league.current_elo
+                    'league_current_elo': league.current_elo,
+                    'pbt_active_agent_idx': active_agent_idx if population else 0,
+                    'pbt_step_counter': pbt_step_counter if population else 0,
+                    'koth_active_pid': koth_active_pid if config.koth_mode else 1,
+                    'koth_step_counter': koth_step_counter if config.koth_mode else 0,
+                    'frozen_models': frozen_models if config.koth_mode else {}
                 }
                 atomic_torch_save(data, latest_ckpt)
                 _log_learner.info("Saved checkpoint to %s", latest_ckpt)
                 
-                # Save ReplayBuffer (atomic save built into buffer.save)
+                # Save ReplayBuffer
                 try:
                     buffer_path = os.path.join(config.checkpoint_dir, 'replay_buffer.pkl')
-                    report = buffer.memory_report()
-                    print(f"[Learner] Saving replay buffer ({report['num_games']} games, "
-                          f"{report['total_memory_gb']:.2f}/{report['max_memory_gb']:.0f} GB, "
-                          f"avg_q={report['avg_quality']:.3f})...")
-                    buffer.save(buffer_path)
-                    print(f"[Learner] Saved replay buffer to {buffer_path}")
+                    res = buffer_cmd_sync({'type': 'save', 'path': buffer_path}, timeout=600)
+                    if res and res.get('type') == 'save_ok':
+                        report = res.get('report', {})
+                        print(f"[Learner] Saved replay buffer ({report.get('num_games')} games, "
+                              f"{report.get('total_memory_gb', 0):.2f}/{report.get('max_memory_gb', 0):.0f} GB, "
+                              f"avg_q={report.get('avg_quality', 0):.3f}) to {buffer_path}")
                 except Exception as e:
                     _log.error("[Learner] Failed to save replay buffer: %s", e)
 
@@ -1363,20 +1446,34 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
             final_data = {
                 'step': step,
                 'model': final_state,
+                'network_state_dict': final_state, # For cross-compatibility
                 'optimizer': optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
                 'stats': shared_stats.get_info(),
                 'curriculum_state': curriculum.state_dict(),
-                'league_current_elo': league.current_elo
+                'league_current_elo': league.current_elo,
+                'pbt_active_agent_idx': active_agent_idx if population else 0,
+                'pbt_step_counter': pbt_step_counter if population else 0,
+                'koth_active_pid': koth_active_pid if config.koth_mode else 1,
+                'koth_step_counter': koth_step_counter if config.koth_mode else 0,
+                'frozen_models': frozen_models if config.koth_mode else {}
             }
             atomic_torch_save(final_data, latest_ckpt)
             buffer_path = os.path.join(config.checkpoint_dir, 'replay_buffer.pkl')
-            buffer.save(buffer_path)
+            buffer_cmd_sync({'type': 'save', 'path': buffer_path}, timeout=600)
             print(f"[Learner] Final checkpoint saved at step {step}.")
         except Exception as e:
             _log.warning("[Learner] Final checkpoint save failed: %s", e)
 
-        # Cleanup prefetcher
+        # Cleanup buffer process and prefetcher
+        try:
+            buffer_cmd_sync({'type': 'stop'}, timeout=5)
+            p_buffer.join(timeout=5)
+            if p_buffer.is_alive():
+                p_buffer.terminate()
+        except Exception:
+            pass
+
         try:
             prefetcher.shutdown(wait=False)
         except Exception:
