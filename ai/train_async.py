@@ -141,7 +141,7 @@ class SharedStats:
 
 
 def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, shared_stats,
-               live_queue=None, shared_model=None, weights_version=None, weights_lock=None):
+               live_queue=None, shared_model=None, weights_version=None, weights_lock=None, shared_curriculum_stage=None):
     """Actor process: runs on CPU, generates games."""
     # Loop: (1) load weights from shared memory or file, (2) optionally load curriculum/league/KOTH state, (3) play game(s), (4) push to game_queue.
     try:
@@ -294,7 +294,9 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
 
                 # Curriculum settings
                 current_curriculum_stage = 0
-                if 'state' in locals() and isinstance(state, dict):
+                if shared_curriculum_stage is not None:
+                    current_curriculum_stage = shared_curriculum_stage.value
+                elif 'state' in locals() and isinstance(state, dict):
                     current_curriculum_stage = state.get('stage', 0)
                 
                 if getattr(config, 'auto_curriculum', False):
@@ -428,7 +430,7 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
 
 
 def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event, shared_stats,
-                 live_queue=None, shared_model=None, weights_version=None, weights_lock=None):
+                 live_queue=None, shared_model=None, weights_version=None, weights_lock=None, shared_curriculum_stage=None):
     """Learner process: runs on GPU, trains network."""
     # Loop: (1) consume games from queue, (2) buffer and validate, (3) prefetch batch, (4) train_step, (5) checkpoint/curriculum/league/PBT, (6) optionally push weights to shared memory.
     try:
@@ -874,6 +876,9 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
             if last_stage == -1:
                  # Fallback / Fresh start
                  last_stage = curriculum.current_stage_idx
+                 
+            if shared_curriculum_stage is not None:
+                 shared_curriculum_stage.value = last_stage
 
         while step < args.steps and not stop_event.is_set():
             # 0. Curriculum Check (Learner side)
@@ -1222,6 +1227,8 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 if curriculum.check_graduation(league=league):
                     new_stage = curriculum.advance(league=league)
                     if new_stage:
+                        if shared_curriculum_stage is not None:
+                            shared_curriculum_stage.value = new_stage.stage_id
                         broadcast('curriculum_graduation', {
                             'stage_id': new_stage.stage_id,
                             'stage': str(new_stage),
@@ -1453,10 +1460,10 @@ def main():
     weights_path = os.path.join(config.checkpoint_dir, 'shared_weights.pt')
     memory_path = os.path.join(config.checkpoint_dir, 'shared_memory.pt')
     
-    # Elasticity: bounded queue; actors block when full until learner drains (see SCALABILITY.md)
     game_queue = mp.Queue(maxsize=config.game_queue_maxsize)
     stop_event = mp.Event()
     shared_stats = SharedStats()
+    shared_curriculum_stage = mp.Value('i', 0)
 
     live_queue = mp.Queue(maxsize=config.live_queue_maxsize)
 
@@ -1476,13 +1483,13 @@ def main():
         lq = live_queue if i == 0 else None
         p = mp.Process(target=actor_loop,
                        args=(i, config, game_queue, weights_path, memory_path,
-                             stop_event, shared_stats, lq, shared_model, weights_version, weights_lock))
+                             stop_event, shared_stats, lq, shared_model, weights_version, weights_lock, shared_curriculum_stage))
         p.start()
         processes.append(p)
     
     p_learner = mp.Process(target=learner_loop,
                            args=(config, args, game_queue, weights_path, memory_path,
-                                 stop_event, shared_stats, live_queue, shared_model, weights_version, weights_lock))
+                                 stop_event, shared_stats, live_queue, shared_model, weights_version, weights_lock, shared_curriculum_stage))
     p_learner.start()
     processes.append(p_learner)
 

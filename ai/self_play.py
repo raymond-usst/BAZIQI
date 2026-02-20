@@ -217,16 +217,25 @@ def play_game(network: Union[torch.nn.Module, Dict[int, torch.nn.Module]], confi
             board_r, board_c = env.action_to_board(action, center[0], center[1], config.local_view_size)
 
             # Validate the action is legal on the actual board
+            action_was_legal = True
             if board_r < 0 or board_r >= env.BOARD_SIZE or board_c < 0 or board_c >= env.BOARD_SIZE:
                 legal = env.legal_moves_local(center[0], center[1], config.local_view_size)
                 if len(legal) == 0:
                     break
                 board_r, board_c = legal[np.random.randint(len(legal))]
+                action_was_legal = False
             elif env.board[board_r, board_c] != 0:
                 legal = env.legal_moves_local(center[0], center[1], config.local_view_size)
                 if len(legal) == 0:
                     break
                 board_r, board_c = legal[np.random.randint(len(legal))]
+                action_was_legal = False
+
+            if not action_was_legal:
+                # Update history with the actual fallback action that was played
+                fallback_action = env.board_to_action(board_r, board_c, center[0], center[1], config.local_view_size)
+                if len(history.actions) > 0:
+                    history.actions[-1] = fallback_action
 
             # Broadcast the move
             if broadcast_fn:
