@@ -105,16 +105,21 @@ class MuZeroConfig:
     priority_alpha: float = 0.6         # Prioritized sampling sharpness (0=uniform, 1=proportional)
     min_buffer_games: int = 100         # Minimum games to keep (won't evict below this)
 
+    # --- IPC Batched Inference ---
+    use_ipc_inference: bool = False     # Use ZeroMQ IPC for batched self-play inference
+    ipc_batch_size: int = 64            # Target batch size for inference server
+    ipc_timeout_ms: float = 2.0         # Max wait (ms) before processing partial batch
+
     # --- Scale / train_async ---
     max_game_steps: int = 5000          # Cap per-game steps in self-play to avoid runaway (see SCALABILITY.md)
-    game_queue_maxsize: int = 200       # Max games in queue between actors and learner (backpressure)
+    game_queue_maxsize: int = 1000      # Max games in queue between actors and learner (backpressure)
     live_queue_maxsize: int = 2000      # Max live events for dashboard
     prefetch_workers: int = 2           # Learner batch prefetcher thread count
 
     # --- Session (Multi-Game) ---
-    session_length: int = 5              # games per session (adaptive during training)
-    session_length_min: int = 3          # min session length (early training)
-    session_length_max: int = 7          # max session length (late training)
+    session_length: int = 5              # games per session (Best-of-5)
+    session_length_min: int = 5          # fixed Best-of-5
+    session_length_max: int = 5          # fixed Best-of-5
     placement_rewards: tuple = (1.0, -0.2, -1.0)  # 1st/2nd/3rd reward mapping
     placement_points: tuple = (5, 2, 0)             # 1st/2nd/3rd point values
 

@@ -26,6 +26,7 @@ from ai.train import train_step, save_checkpoint, WS_CLIENTS, WS_LOOP, start_ws_
 from ai.pbt import Population
 from ai.curriculum import CurriculumManager
 from ai.league import LeagueManager
+from ai.ipc_inference import InferenceClient, InferenceServer
 from ai.board_render import board_to_image_path
 from ai.data_augment import apply_board_augment
 from ai.log_utils import get_logger
@@ -95,6 +96,10 @@ class SharedStats:
         # Placement tracking: [p1_1st, p1_2nd, p1_3rd, p2_1st, p2_2nd, p2_3rd, p3_1st, p3_2nd, p3_3rd]
         self.placement_counts = mp.Array('i', 9)
         self.ranked_games = mp.Value('i', 0)
+        # Round-level tracking (Best-of-5)
+        self.total_rounds = mp.Value('i', 0)
+        self.round_win_counts = mp.Array('i', 4)  # red, green, blue, draw
+        self.round_placement_counts = mp.Array('i', 9)  # same layout as placement_counts
         self.lock = mp.Lock()
 
     def update_game(self, winner, length, rankings=None):
@@ -112,6 +117,20 @@ class SharedStats:
                     if 1 <= pid <= 3 and 0 <= placement <= 2:
                         idx = (pid - 1) * 3 + placement
                         self.placement_counts[idx] += 1
+
+    def update_round(self, round_winner, round_rankings):
+        """Update round-level stats after a Best-of-5 round completes."""
+        with self.lock:
+            self.total_rounds.value += 1
+            if round_winner is None:
+                self.round_win_counts[3] += 1
+            elif 1 <= round_winner <= 3:
+                self.round_win_counts[round_winner - 1] += 1
+            if round_rankings:
+                for pid, placement in round_rankings:
+                    if 1 <= pid <= 3 and 0 <= placement <= 2:
+                        idx = (pid - 1) * 3 + placement
+                        self.round_placement_counts[idx] += 1
 
     def get_info(self):
         with self.lock:
@@ -134,7 +153,19 @@ class SharedStats:
                     '1': [self.placement_counts[0], self.placement_counts[1], self.placement_counts[2]],
                     '2': [self.placement_counts[3], self.placement_counts[4], self.placement_counts[5]],
                     '3': [self.placement_counts[6], self.placement_counts[7], self.placement_counts[8]],
-                }
+                },
+                'total_rounds': self.total_rounds.value,
+                'round_wins': {
+                    '1': self.round_win_counts[0],
+                    '2': self.round_win_counts[1],
+                    '3': self.round_win_counts[2],
+                    'draw': self.round_win_counts[3],
+                },
+                'round_placements': {
+                    '1': [self.round_placement_counts[0], self.round_placement_counts[1], self.round_placement_counts[2]],
+                    '2': [self.round_placement_counts[3], self.round_placement_counts[4], self.round_placement_counts[5]],
+                    '3': [self.round_placement_counts[6], self.round_placement_counts[7], self.round_placement_counts[8]],
+                },
             }
 
 # CurriculumScheduler removed in favor of CurriculumManager
@@ -240,6 +271,11 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
         memory_bank = None
         if config.use_engram:
             memory_bank = MemoryBank(config.memory_capacity, config.hidden_state_dim, config.hidden_state_dim)
+
+        ipc_client = None
+        if getattr(config, 'use_ipc_inference', False):
+            ipc_client = InferenceClient(endpoint="tcp://127.0.0.1:5556")
+            print(f"[Actor {rank}] Using ZeroMQ IPC Inference Client (5556).")
         
         print(f"[Actor {rank}] Started on CPU (compiled={_compiled}). PID: {os.getpid()}")
         
@@ -382,7 +418,7 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
                     board_size, win_length = config.board_size, config.win_length
 
                 # Determine network argument
-                network_arg = model
+                network_arg = ipc_client if ipc_client is not None else model
                 is_league_session = False
                 current_opp_info = {}
 
@@ -432,11 +468,12 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
                     
                 if not is_league_session and config.koth_mode:
                     network_arg = {}
+                    base_net = ipc_client if ipc_client is not None else model
                     for pid in [1, 2, 3]:
                         if pid == active_pid:
-                            network_arg[pid] = model
+                            network_arg[pid] = base_net
                         else:
-                            network_arg[pid] = frozen_nets.get(pid, model)
+                            network_arg[pid] = frozen_nets.get(pid, base_net)
 
                 session_games = play_session(
                     network_arg, config,
@@ -445,7 +482,8 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
                     game_index_base=rank * 100000 + games_played,
                     training_step=approx_step,
                     board_size_override=board_size,
-                    win_length_override=win_length
+                    win_length_override=win_length,
+                    pbt_elo=league.current_elo
                 )
 
                 # 3. Send each game to queue (timeout to prevent deadlock if learner crashes)
@@ -471,6 +509,14 @@ def actor_loop(rank, config, game_queue, weights_path, memory_path, stop_event, 
                         break
                     shared_stats.update_game(game.winner, len(game), rankings=game.rankings)
                     games_played += 1
+
+                # Update round stats (session = round in BO5)
+                if session_games:
+                    last_g = session_games[-1]
+                    rw = getattr(last_g, 'round_winner', None)
+                    rr = getattr(last_g, 'round_rankings', None)
+                    if rr:
+                        shared_stats.update_round(rw, rr)
 
                 # Every 100 total games: save last game board image (Actor 0 only)
                 if rank == 0 and session_games:
@@ -522,6 +568,13 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
         # Init Model (compile happens AFTER resume/init to avoid _orig_mod prefix issues)
         model = MuZeroNetwork(config).to(device)
         model.train()
+
+        # IPC Batched Inference Server
+        if getattr(config, 'use_ipc_inference', False):
+            _log.info("[Learner] Starting IPC Inference Server on GPU (5556)")
+            ipc_server = InferenceServer(model, config, device, endpoint="tcp://127.0.0.1:5556")
+            ipc_thread = threading.Thread(target=ipc_server.serve_forever, daemon=True)
+            ipc_thread.start()
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
         # Disable fp16 GradScaler: model is small enough for fp32 (4.5GB VRAM at bs=512)
@@ -622,11 +675,15 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     if unexpected:
                         print(f"[Learner] Ignored old keys: {len(unexpected)} keys")
                     try:
-                        if 'optimizer' in data: optimizer.load_state_dict(data['optimizer'])
+                        # Cross-compatible: try 'optimizer' then 'optimizer_state_dict'
+                        opt_state = data.get('optimizer', data.get('optimizer_state_dict'))
+                        if opt_state:
+                            optimizer.load_state_dict(opt_state)
                     except ValueError as e:
                         print(f"[Learner] Optimizer state incompatible (architecture changed), resetting: {e}")
                     # Skip loading scaler state — we now use fp32 only (scaler disabled)
-                    step = data.get('step', 0)
+                    # Cross-compatible step: try 'step' then 'global_step'
+                    step = data.get('step', data.get('global_step', 0))
                     model_loaded_from_ckpt = True
                 else:
                     if data is not None:
@@ -650,6 +707,12 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     shared_stats.win_counts[1] = wc.get('2', 0)
                     shared_stats.win_counts[2] = wc.get('3', 0)
                     shared_stats.win_counts[3] = wc.get('draw', 0)
+                    shared_stats.ranked_games.value = stats.get('ranked_games', 0)
+                    plc = stats.get('placements', {})
+                    for pid in (1, 2, 3):
+                        arr = plc.get(str(pid), [0, 0, 0])
+                        for pl in range(3):
+                            shared_stats.placement_counts[(pid - 1) * 3 + pl] = arr[pl] if pl < len(arr) else 0
                 
                 # Checkpoint KOTH restore
                 koth_active_pid = data.get('koth_active_pid', 1) if isinstance(data, dict) else 1
@@ -930,24 +993,25 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
             return pinned
 
         last_stage = -1
+        
+        # Unconditionally restore curriculum and league states from checkpoint
+        if data is not None and isinstance(data, dict):
+            if 'curriculum_state' in data:
+                curriculum.load_state_dict(data['curriculum_state'])
+                last_stage = curriculum.current_stage_idx
+            elif 'curriculum_stage' in data:
+                last_stage = data['curriculum_stage']
+                curriculum.set_stage(last_stage)
+            else:
+                _log_learner.warning("Resume: no curriculum_state or curriculum_stage in checkpoint; using default stage.")
+
+            if 'league_current_elo' in data:
+                league.current_elo = data['league_current_elo']
+                _log_learner.info("League Elo restored: %.1f", league.current_elo)
+            else:
+                _log_learner.warning("Resume: league_current_elo missing in checkpoint; keeping default 1200.")
+                
         if getattr(config, 'auto_curriculum', False):
-            # If we resumed, use the stage from checkpoint.
-            if data is not None and isinstance(data, dict):
-                if 'curriculum_state' in data:
-                    curriculum.load_state_dict(data['curriculum_state'])
-                    last_stage = curriculum.current_stage_idx
-                elif 'curriculum_stage' in data:
-                    last_stage = data['curriculum_stage']
-                    curriculum.set_stage(last_stage)
-                else:
-                    _log_learner.warning("Resume: no curriculum_state or curriculum_stage in checkpoint; using default stage.")
-
-                if 'league_current_elo' in data:
-                    league.current_elo = data['league_current_elo']
-                    _log_learner.info("League Elo restored: %.1f", league.current_elo)
-                else:
-                    _log_learner.warning("Resume: league_current_elo missing in checkpoint; keeping default 1200.")
-
             # If resume didn't specify or it's a fresh start, calculate from step.
             if last_stage == -1:
                  # Fallback / Fresh start
@@ -975,7 +1039,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 st = curriculum.get_current_stage()
                 expected_size = st.board_size
 
-            while not game_queue.empty() and fetched < 50:
+            while not game_queue.empty() and fetched < 200:
                 try:
                     game = game_queue.get_nowait()
                     
@@ -1043,7 +1107,7 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 if 'start_wait_time' not in locals():
                     start_wait_time = time.time()
                 
-                time.sleep(1.0)
+                time.sleep(0.2)
                 current_time = datetime.now().strftime("%H:%M:%S")
                 
                 count = shared_buffer_games.value
@@ -1068,6 +1132,9 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     'win_counts': stats['wins'],
                     'ranked_games': stats['ranked_games'],
                     'placements': stats['placements'],
+                    'total_rounds': stats['total_rounds'],
+                    'round_wins': stats['round_wins'],
+                    'round_placements': stats['round_placements'],
                     'buffer_games': count,
                     'step': f"Gen {count}/{config.min_buffer_size}",
                     'lr': 0.0
@@ -1226,15 +1293,21 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     loss_dict = {'total': float('nan'), '_nan': True}
 
             
-            # ── NaN recovery logic ──
+            # ── NaN recovery logic (graduated 3-tier) ──
             if loss_dict.get('_nan', False):
                 nan_streak += 1
                 if nan_streak % 10 == 1:
                     _log.warning("[Learner] NaN loss detected (streak=%s). Skipping step.", nan_streak)
                 
-                if nan_streak >= 50:
-                    # Drastic recovery: re-sanitize model and reset optimizer + scaler
-                    _log.error("[Learner] CRITICAL: %s consecutive NaN losses. Re-sanitizing model...", nan_streak)
+                # Tier 1 (10 NaN streak): Halve learning rate temporarily
+                if nan_streak == 10:
+                    _log.warning("[Learner] NaN Tier 1: Halving learning rate temporarily.")
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = pg['lr'] * 0.5
+                
+                # Tier 2 (30 NaN streak): Sanitize model weights + reset scaler
+                if nan_streak == 30:
+                    _log.error("[Learner] NaN Tier 2: Sanitizing model weights and resetting scaler.")
                     fixed = 0
                     for name, param in list(model.named_parameters()) + list(model.named_buffers()):
                         if torch.isnan(param).any() or torch.isinf(param).any():
@@ -1244,12 +1317,26 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                                 else:
                                     param[torch.isnan(param) | torch.isinf(param)] = 0.0
                             fixed += 1
+                    scaler = torch.amp.GradScaler('cuda', enabled=False)
+                    print(f"[Learner] Tier 2: Sanitized {fixed} tensors, reset scaler.", flush=True)
+
+                # Tier 3 (50 NaN streak): Full optimizer reset (last resort)
+                if nan_streak >= 50:
+                    _log.error("[Learner] NaN Tier 3 CRITICAL: %s consecutive NaN losses. Full optimizer reset.", nan_streak)
+                    # Re-sanitize anything Tier 2 might have missed
+                    for name, param in list(model.named_parameters()) + list(model.named_buffers()):
+                        if torch.isnan(param).any() or torch.isinf(param).any():
+                            with torch.no_grad():
+                                if 'running_var' in name or 'var' in name:
+                                    param[torch.isnan(param) | torch.isinf(param)] = 1.0
+                                else:
+                                    param[torch.isnan(param) | torch.isinf(param)] = 0.0
                     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
                     for param_group in optimizer.param_groups:
                         param_group.setdefault('initial_lr', config.learning_rate)
                     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=step - 1)
                     scaler = torch.amp.GradScaler('cuda', enabled=False)
-                    print(f"[Learner] Re-sanitized {fixed} tensors. Reset optimizer + scheduler + scaler (scale=256).", flush=True)
+                    print(f"[Learner] Tier 3: Full optimizer + scheduler + scaler reset.", flush=True)
                     nan_streak = 0
                 
                 continue  # Skip this step entirely (don't increment step counter)
@@ -1289,6 +1376,10 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                     'win_counts': stats_snapshot['wins'],
                     'ranked_games': stats_snapshot['ranked_games'],
                     'placements': stats_snapshot['placements'],
+                    'league_elo': float(league.current_elo),
+                    'total_rounds': stats_snapshot['total_rounds'],
+                    'round_wins': stats_snapshot['round_wins'],
+                    'round_placements': stats_snapshot['round_placements'],
                 }
                 if loss_dict.get('policy_entropy') is not None:
                     m['policy_entropy'] = float(loss_dict['policy_entropy'])
@@ -1359,15 +1450,19 @@ def learner_loop(config, args, game_queue, weights_path, memory_path, stop_event
                 if memory_bank:
                     atomic_torch_save(memory_bank.state_dict(), memory_path)
 
-            # 4. Checkpoint
-            if step % 1000 == 0:
+            # 4. Checkpoint (interval from config, fallback 500 to avoid save every step)
+            ckpt_interval = getattr(config, 'checkpoint_interval', 500) or 500
+            if step > 0 and step % ckpt_interval == 0:
                 # Full checkpoint
                 data = {
                     'step': step,
                     'model': _strip_compiled_prefix(model.state_dict()),
                     'network_state_dict': _strip_compiled_prefix(model.state_dict()), # For cross-compatibility with train.py
                     'optimizer': optimizer.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),  # Cross-compat alias
                     'scaler': scaler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),  # Cross-compat alias
+                    'global_step': step,  # Cross-compat alias
                     'stats': shared_stats.get_info(),
                     'curriculum_state': curriculum.state_dict(),
                     'league_current_elo': league.current_elo,
@@ -1524,6 +1619,8 @@ def main():
     parser.add_argument('--pbt-period', type=int, help='Steps between PBT evolution events')
     parser.add_argument('--pbt-mutation-rate', type=float, help='Mutation rate for PBT hyperparameters')
     
+    parser.add_argument('--ipc', action='store_true', help='Enable ZeroMQ IPC Batched Inference for Actors')
+    
     args = parser.parse_args()
     
     mp.set_start_method('spawn', force=True)
@@ -1542,6 +1639,9 @@ def main():
         config.auto_curriculum = False
         print("[Config] --final-stage-only: 100x100, 8-in-a-row, no curriculum.")
     config.koth_mode = args.koth_mode
+    if args.ipc:
+        config.use_ipc_inference = True
+        print("[Config] IPC Batched Inference Enabled via CLI.")
     if args.koth_period: config.koth_period = args.koth_period
     if args.checkpoint_interval: config.checkpoint_interval = args.checkpoint_interval
     

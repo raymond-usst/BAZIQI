@@ -2,8 +2,8 @@
  * Training Dashboard - Real-time visualization
  * Connects via WebSocket to MuZero training process
  *
- * Supports session-based scoring (5:2:0 placement system)
- * and per-player cumulative score tracking.
+ * Supports session-based scoring (3:0:-2 placement system)
+ * and Best-of-5 round tracking with per-game/per-round view toggle.
  */
 (function () {
     'use strict';
@@ -31,7 +31,7 @@
     let startTime = Date.now();
     let lastMove = null;
 
-    // Session / Placement tracking
+    // Session / Placement tracking (per-game)
     let placementCounts = {
         1: [0, 0, 0], // [1st, 2nd, 3rd] for player 1
         2: [0, 0, 0],
@@ -40,6 +40,20 @@
     let cumulativePoints = { 1: 0, 2: 0, 3: 0 };
     let rankedGames = 0; // games with ranking data
     let currentSessionInfo = null; // latest session context
+
+    // Round-level tracking (per-round / Best-of-5)
+    let roundPlacementCounts = {
+        1: [0, 0, 0], // [Champion, Runner-up, Third] per round
+        2: [0, 0, 0],
+        3: [0, 0, 0],
+    };
+    let roundWinCounts = { 1: 0, 2: 0, 3: 0, draw: 0 };
+    let totalRounds = 0;
+    let lastSeenTotalRounds = 0; // detect round transitions from server data
+
+    // View mode: 'game' or 'round'
+    let winrateViewMode = 'game';
+    let placementViewMode = 'game';
 
     // ELO tracking
     let eloRatings = { 1: ELO_INITIAL, 2: ELO_INITIAL, 3: ELO_INITIAL };
@@ -50,6 +64,27 @@
     // Rolling score history for chart (game-by-game)
     const scoreHistory = { labels: [], red: [], green: [], blue: [] };
     const MAX_SCORE_POINTS = 300;
+    // Per-round points (resets to 0 each round, driven by server data)
+    let roundPoints = { 1: 0, 2: 0, 3: 0 };
+    let roundGameIndex = 0; // game index within current round (0-4 for BO5)
+    // All-time baselines at start of current round
+    let roundBaselinePoints = { 1: 0, 2: 0, 3: 0 };
+    let roundBaselineRankedGames = 0;
+
+    // ---- Toggle Handler (exposed globally for onclick) ----
+    window.__dashToggle = function (panel, mode) {
+        if (panel === 'winrate') {
+            winrateViewMode = mode;
+            document.getElementById('wr-mode-game').classList.toggle('active', mode === 'game');
+            document.getElementById('wr-mode-round').classList.toggle('active', mode === 'round');
+            updateWinRates();
+        } else if (panel === 'placement') {
+            placementViewMode = mode;
+            document.getElementById('plc-mode-game').classList.toggle('active', mode === 'game');
+            document.getElementById('plc-mode-round').classList.toggle('active', mode === 'round');
+            updatePlacementDisplay();
+        }
+    };
 
     // ---- Init ----
     function init() {
@@ -110,9 +145,11 @@
     function setStatus(status) {
         const dot = document.getElementById('ws-status');
         const label = document.getElementById('ws-label');
+        const hint = document.getElementById('connection-hint');
         dot.className = 'status-dot ' + status;
         const labels = { connected: '已连接', disconnected: '未连接', connecting: '连接中...' };
         label.textContent = labels[status] || status;
+        if (hint) hint.classList.toggle('hidden', status === 'connected');
     }
 
     // ---- Message Handler ----
@@ -157,18 +194,91 @@
                     msg.winner ? `${PLAYER_NAMES[msg.winner]} 获胜 (${gameStep}步)` : `平局 (${gameStep}步)`;
                 break;
 
+            case 'round_end':
+                // Best-of-5 round completed
+                totalRounds++;
+                if (msg.round_winner && msg.round_winner >= 1 && msg.round_winner <= 3) {
+                    roundWinCounts[msg.round_winner]++;
+                } else {
+                    roundWinCounts.draw++;
+                }
+                // Resolve round_rankings: defensive parse (array of [pid, placement]) or fallback from round_winner/round_scores
+                let resolvedRankings = [];
+                if (msg.round_rankings && msg.round_rankings.length > 0) {
+                    for (const entry of msg.round_rankings) {
+                        const rawPid = Array.isArray(entry) ? entry[0] : (entry.pid != null ? entry.pid : entry[0]);
+                        const rawPl = Array.isArray(entry) ? entry[1] : (entry.placement != null ? entry.placement : entry[1]);
+                        const pid = Number(rawPid);
+                        const placement = Number(rawPl);
+                        if (!Number.isNaN(pid) && !Number.isNaN(placement) && pid >= 1 && pid <= 3 && placement >= 0 && placement <= 2)
+                            resolvedRankings.push([pid, placement]);
+                    }
+                }
+                if (resolvedRankings.length === 0 && (msg.round_winner || msg.round_scores)) {
+                    const scores = msg.round_scores || { 1: 0, 2: 0, 3: 0 };
+                    const winner = msg.round_winner;
+                    if (winner >= 1 && winner <= 3) {
+                        resolvedRankings.push([winner, 0]);
+                        const others = [1, 2, 3].filter(p => p !== winner).sort((a, b) => (scores[b] || 0) - (scores[a] || 0));
+                        others.forEach((pid, i) => resolvedRankings.push([pid, i + 1]));
+                    } else {
+                        const order = [1, 2, 3].sort((a, b) => (scores[b] || 0) - (scores[a] || 0));
+                        order.forEach((pid, i) => resolvedRankings.push([pid, i]));
+                    }
+                }
+                for (const [pid, placement] of resolvedRankings) {
+                    if (pid >= 1 && pid <= 3 && placement >= 0 && placement <= 2)
+                        roundPlacementCounts[pid][placement]++;
+                }
+                if (winrateViewMode === 'round') updateWinRates();
+                if (placementViewMode === 'round') updatePlacementDisplay();
+                // Score chart reset + ELO update now handled by onRoundsChanged via server data
+                if (resolvedRankings.length >= 2)
+                    updateEloFromRoundRankings(resolvedRankings);
+                break;
+
             case 'training_metrics':
                 updateLossChart(msg);
                 updateStatsChart(msg);
                 updateSummaryBar(msg);
-                // Sync authoritative placement data from all actors (not just Actor 0)
+                // Sync games/win counts from server so 累计胜率 matches 名次分布 (same source)
+                if (msg.total_games !== undefined) totalGames = msg.total_games;
+                if (msg.win_counts) winCounts = { ...winCounts, ...msg.win_counts };
+                updateWinRates();
+                // Sync authoritative round data from all actors
+                if (msg.total_rounds !== undefined) {
+                    totalRounds = msg.total_rounds;
+                }
+                if (msg.round_wins) {
+                    roundWinCounts = {
+                        1: msg.round_wins['1'] || 0,
+                        2: msg.round_wins['2'] || 0,
+                        3: msg.round_wins['3'] || 0,
+                        draw: msg.round_wins['draw'] || 0,
+                    };
+                }
+                if (msg.round_placements) {
+                    for (const pid of [1, 2, 3]) {
+                        const arr = msg.round_placements[String(pid)] || [0, 0, 0];
+                        roundPlacementCounts[pid] = [arr[0] || 0, arr[1] || 0, arr[2] || 0];
+                    }
+                }
+                // Detect round transition → update baselines + ELO (BEFORE score chart sync)
+                if (msg.total_rounds !== undefined && msg.total_rounds > lastSeenTotalRounds) {
+                    onRoundsChanged(msg.total_rounds - lastSeenTotalRounds);
+                    lastSeenTotalRounds = msg.total_rounds;
+                }
+                // Sync authoritative placement data AFTER baseline update
                 if (msg.placements && msg.ranked_games) {
                     syncPlacementsFromServer(msg.ranked_games, msg.placements);
-                    updateScoresChart();
-                    // Replay ELO from authoritative server placements
-                    replayEloFromPlacements(msg.placements, msg.ranked_games);
-                    updateEloChart();
-                    updateEloBadge();
+                }
+                // Always update both views (game + round) so they stay fresh
+                updateWinRates();
+                updatePlacementDisplay();
+                // Sync server-pushed league Elo (authoritative, single value)
+                if (msg.league_elo !== undefined) {
+                    const sumEl = document.getElementById('sum-elo');
+                    if (sumEl) sumEl.textContent = `ELO: ${Math.round(msg.league_elo)}`;
                 }
                 break;
 
@@ -180,26 +290,54 @@
                 // Sync placement/ELO from all actors
                 if (msg.placements && msg.ranked_games) {
                     syncPlacementsFromServer(msg.ranked_games, msg.placements);
-                    updateScoresChart();
-                    replayEloFromPlacements(msg.placements, msg.ranked_games);
-                    updateEloChart();
-                    updateEloBadge();
                 }
                 break;
 
             case 'status':
-                // Initial status update
-                if (msg.total_games) totalGames = msg.total_games;
+                if (msg.total_games !== undefined) totalGames = msg.total_games;
                 if (msg.win_counts) winCounts = { ...winCounts, ...msg.win_counts };
-                updateWinRates();
                 updateSummaryBar(msg);
-                // Sync placement/ELO from all actors
+                // Sync authoritative round data
+                if (msg.total_rounds !== undefined) totalRounds = msg.total_rounds;
+                if (msg.round_wins) {
+                    roundWinCounts = {
+                        1: msg.round_wins['1'] || 0,
+                        2: msg.round_wins['2'] || 0,
+                        3: msg.round_wins['3'] || 0,
+                        draw: msg.round_wins['draw'] || 0,
+                    };
+                }
+                if (msg.round_placements) {
+                    for (const pid of [1, 2, 3]) {
+                        const arr = msg.round_placements[String(pid)] || [0, 0, 0];
+                        roundPlacementCounts[pid] = [arr[0] || 0, arr[1] || 0, arr[2] || 0];
+                    }
+                }
+                // Detect round transition BEFORE placement sync
+                if (msg.total_rounds !== undefined && msg.total_rounds > lastSeenTotalRounds) {
+                    onRoundsChanged(msg.total_rounds - lastSeenTotalRounds);
+                    lastSeenTotalRounds = msg.total_rounds;
+                }
+                // Now sync placements (uses updated baselines)
                 if (msg.placements && msg.ranked_games) {
                     syncPlacementsFromServer(msg.ranked_games, msg.placements);
-                    updateScoresChart();
-                    replayEloFromPlacements(msg.placements, msg.ranked_games);
-                    updateEloChart();
-                    updateEloBadge();
+                }
+                updateWinRates();
+                updatePlacementDisplay();
+                // Only push to loss/stats charts when step is numeric (training step), not "Gen X/Y"
+                const stepLabel = msg.step != null ? String(msg.step) : (msg.buffer_games != null ? `Gen ${msg.buffer_games}` : '');
+                if (stepLabel && lossChart && statsChart && (typeof msg.step === 'number' || Number.isInteger(msg.step))) {
+                    const placeholder = {
+                        step: msg.step,
+                        loss: 0,
+                        loss_value: 0,
+                        loss_reward: 0,
+                        loss_policy: 0,
+                        loss_focus: 0,
+                        avg_game_length: msg.avg_len != null ? msg.avg_len : 0,
+                    };
+                    updateLossChart(placeholder);
+                    updateStatsChart(placeholder);
                 }
                 break;
 
@@ -239,7 +377,6 @@
                     scoreHistory.green.length = 0;
                     scoreHistory.blue.length = 0;
 
-                    let lastRankedGames = 0;
                     for (const entry of msg.data) {
                         if (entry.placements && entry.ranked_games) {
                             // Sync placement counts
@@ -251,14 +388,7 @@
                                     + counts[1] * PLACEMENT_POINTS[1]
                                     + counts[2] * PLACEMENT_POINTS[2];
                             }
-
-                            // Replay ELO for new games since last entry
-                            const newGames = entry.ranked_games - lastRankedGames;
-                            if (newGames > 0) {
-                                // Estimate per-game ELO from placement proportions
-                                replayEloFromPlacements(entry.placements, entry.ranked_games);
-                            }
-                            lastRankedGames = entry.ranked_games;
+                            // ELO not replayed from history (per-round ELO has no round boundaries in history)
 
                             // Push to score history
                             scoreHistory.labels.push(entry.ranked_games);
@@ -299,18 +429,20 @@
             if (pid >= 1 && pid <= 3 && placement >= 0 && placement <= 2) {
                 placementCounts[pid][placement]++;
                 cumulativePoints[pid] += PLACEMENT_POINTS[placement];
+                roundPoints[pid] += PLACEMENT_POINTS[placement];
             }
         }
+        roundGameIndex++;
 
-        // Update placement display only (charts updated by server data via batch_stats/status/training_metrics)
+        // Update placement display and score chart
         updatePlacementDisplay();
+        updateScoresChart();
     }
 
     function syncPlacementsFromServer(serverRankedGames, serverPlacements) {
         /**
          * Overwrite local placement/score state with authoritative data from all actors.
-         * This ensures the placement panel matches the win-rate panel (both cover all actors).
-         * serverPlacements: {'1': [1st, 2nd, 3rd], '2': [...], '3': [...]}
+         * Also computes within-round points for score chart.
          */
         rankedGames = serverRankedGames;
         for (let pid = 1; pid <= 3; pid++) {
@@ -319,8 +451,11 @@
             cumulativePoints[pid] = counts[0] * PLACEMENT_POINTS[0]
                 + counts[1] * PLACEMENT_POINTS[1]
                 + counts[2] * PLACEMENT_POINTS[2];
+            roundPoints[pid] = cumulativePoints[pid] - roundBaselinePoints[pid];
         }
+        roundGameIndex = rankedGames - roundBaselineRankedGames;
         updatePlacementDisplay();
+        updateScoresChart();
     }
 
     // ---- ELO Rating System ----
@@ -387,6 +522,76 @@
             eloHistory.blue.shift();
         }
 
+        updateEloChart();
+        updateEloBadge();
+    }
+
+    /**
+     * Standard Elo expected score: probability A wins against B.
+     */
+    function expectedScore(ratingA, ratingB) {
+        return 1.0 / (1.0 + Math.pow(10, (ratingB - ratingA) / 400.0));
+    }
+
+    /**
+     * Update ELO from a single round's rankings (Best-of-5 round result).
+     * Pushes to eloHistory with totalRounds as x-axis. Used only on round_end.
+     */
+    function updateEloFromRoundRankings(round_rankings) {
+        if (!round_rankings || round_rankings.length < 2) return;
+
+        const plMap = {};
+        for (const [pid, pl] of round_rankings) {
+            plMap[pid] = pl;
+        }
+        const pids = Object.keys(plMap).map(Number);
+        const deltas = {};
+        for (const p of pids) deltas[p] = 0;
+
+        for (let i = 0; i < pids.length; i++) {
+            for (let j = i + 1; j < pids.length; j++) {
+                const pidA = pids[i];
+                const pidB = pids[j];
+                let winner, loser;
+                if (plMap[pidA] < plMap[pidB]) {
+                    winner = pidA; loser = pidB;
+                } else if (plMap[pidB] < plMap[pidA]) {
+                    winner = pidB; loser = pidA;
+                } else {
+                    const eA = expectedScore(eloRatings[pidA], eloRatings[pidB]);
+                    const eB = 1 - eA;
+                    deltas[pidA] += ELO_K * (0.5 - eA);
+                    deltas[pidB] += ELO_K * (0.5 - eB);
+                    continue;
+                }
+                const eW = expectedScore(eloRatings[winner], eloRatings[loser]);
+                const eL = 1 - eW;
+                deltas[winner] += ELO_K * (1 - eW);
+                deltas[loser] += ELO_K * (0 - eL);
+            }
+        }
+        for (const p of pids) {
+            eloRatings[p] = Math.max(100, eloRatings[p] + deltas[p]);
+        }
+
+        const roundX = totalRounds;
+        const lastLabel = eloHistory.labels.length > 0 ? eloHistory.labels[eloHistory.labels.length - 1] : -1;
+        if (lastLabel === roundX) {
+            eloHistory.red[eloHistory.red.length - 1] = Math.round(eloRatings[1]);
+            eloHistory.green[eloHistory.green.length - 1] = Math.round(eloRatings[2]);
+            eloHistory.blue[eloHistory.blue.length - 1] = Math.round(eloRatings[3]);
+        } else {
+            eloHistory.labels.push(roundX);
+            eloHistory.red.push(Math.round(eloRatings[1]));
+            eloHistory.green.push(Math.round(eloRatings[2]));
+            eloHistory.blue.push(Math.round(eloRatings[3]));
+            if (eloHistory.labels.length > MAX_ELO_POINTS) {
+                eloHistory.labels.shift();
+                eloHistory.red.shift();
+                eloHistory.green.shift();
+                eloHistory.blue.shift();
+            }
+        }
         updateEloChart();
         updateEloBadge();
     }
@@ -484,37 +689,73 @@
     }
 
     function updatePlacementDisplay() {
+        const isRound = placementViewMode === 'round';
+        const counts_src = isRound ? roundPlacementCounts : placementCounts;
+        const total = isRound ? totalRounds : rankedGames;
+        const label = isRound ? `${totalRounds} 回合` : `${rankedGames} 局`;
+
         const el = document.getElementById('placement-total');
-        if (el) el.textContent = `${rankedGames} 局`;
+        if (el) el.textContent = label;
 
         for (let pid = 1; pid <= 3; pid++) {
-            const counts = placementCounts[pid];
+            const counts = counts_src[pid];
             for (let pl = 0; pl < 3; pl++) {
                 const cell = document.getElementById(`plc-${pid}-${pl}`);
                 if (cell) cell.textContent = counts[pl];
             }
-            // Average points per game
-            const avg = rankedGames > 0 ? (cumulativePoints[pid] / rankedGames).toFixed(1) : '0.0';
+            // Average points per game/round
+            const pts = counts[0] * PLACEMENT_POINTS[0] + counts[1] * PLACEMENT_POINTS[1] + counts[2] * PLACEMENT_POINTS[2];
+            const avg = total > 0 ? (pts / total).toFixed(1) : '0.0';
             const avgCell = document.getElementById(`plc-${pid}-avg`);
             if (avgCell) avgCell.textContent = avg;
         }
     }
 
+    /**
+     * Called when server reports new completed rounds (totalRounds increased).
+     * Clears score chart and pushes ELO update derived from round placements.
+     */
+    function onRoundsChanged(deltaRounds) {
+        // Update baselines for next round period.
+        // roundPoints = cumulative - baseline naturally drops to ~0.
+        roundBaselinePoints = { 1: cumulativePoints[1], 2: cumulativePoints[2], 3: cumulativePoints[3] };
+        roundBaselineRankedGames = rankedGames;
+        roundPoints = { 1: 0, 2: 0, 3: 0 };
+        roundGameIndex = 0;
+
+        // 2. Derive ELO from round placements
+        for (let d = 0; d < deltaRounds; d++) {
+            const rankings = [];
+            const totalPl = roundPlacementCounts[1][0] + roundPlacementCounts[2][0] + roundPlacementCounts[3][0];
+            if (totalPl > 0) {
+                const pids = [1, 2, 3].sort((a, b) => roundPlacementCounts[b][0] - roundPlacementCounts[a][0]);
+                pids.forEach((pid, i) => rankings.push([pid, i]));
+            }
+            if (rankings.length >= 2) {
+                updateEloFromRoundRankings(rankings);
+            }
+        }
+    }
+
     function updateScoresChart() {
-        const gameNum = rankedGames;
+        const gameNum = roundGameIndex;
         const lastLabel = scoreHistory.labels.length > 0 ? scoreHistory.labels[scoreHistory.labels.length - 1] : -1;
+        // Chart shows points within current round (roundPoints resets each round)
+        const redY = roundPoints[1];
+        const greenY = roundPoints[2];
+        const blueY = roundPoints[3];
 
         if (lastLabel === gameNum) {
             // Same X-value: update last point in-place (dedup)
-            scoreHistory.red[scoreHistory.red.length - 1] = cumulativePoints[1];
-            scoreHistory.green[scoreHistory.green.length - 1] = cumulativePoints[2];
-            scoreHistory.blue[scoreHistory.blue.length - 1] = cumulativePoints[3];
+            scoreHistory.red[scoreHistory.red.length - 1] = redY;
+            scoreHistory.green[scoreHistory.green.length - 1] = greenY;
+            scoreHistory.blue[scoreHistory.blue.length - 1] = blueY;
         } else {
             // New X-value: push new point
             scoreHistory.labels.push(gameNum);
-            scoreHistory.red.push(cumulativePoints[1]);
-            scoreHistory.green.push(cumulativePoints[2]);
-            scoreHistory.blue.push(cumulativePoints[3]);
+            scoreHistory.red.push(redY);
+            scoreHistory.green.push(greenY);
+            scoreHistory.blue.push(blueY);
 
             // Trim to max points
             if (scoreHistory.labels.length > MAX_SCORE_POINTS) {
@@ -666,15 +907,20 @@
 
     // ---- Win Rates ----
     function updateWinRates() {
-        document.getElementById('total-games').textContent = `${totalGames} 局`;
-        if (totalGames === 0) return;
+        const isRound = winrateViewMode === 'round';
+        const total = isRound ? totalRounds : totalGames;
+        const counts = isRound ? roundWinCounts : winCounts;
+        const label = isRound ? `${totalRounds} 回合` : `${totalGames} 局`;
 
-        const rates = {
-            red: (winCounts[1] / totalGames) * 100,
-            green: (winCounts[2] / totalGames) * 100,
-            blue: (winCounts[3] / totalGames) * 100,
-            draw: (winCounts.draw / totalGames) * 100,
-        };
+        document.getElementById('total-games').textContent = label;
+        const rates = total === 0
+            ? { red: 0, green: 0, blue: 0, draw: 0 }
+            : {
+                red: (counts[1] / total) * 100,
+                green: (counts[2] / total) * 100,
+                blue: (counts[3] / total) * 100,
+                draw: ((counts.draw || 0) / total) * 100,
+            };
 
         for (const [key, pct] of Object.entries(rates)) {
             document.getElementById(`wr-${key}`).style.width = pct + '%';
@@ -723,6 +969,10 @@
                 ...commonOptions,
                 scales: {
                     ...commonOptions.scales,
+                    x: {
+                        ...commonOptions.scales.x,
+                        title: { display: true, text: '训练步数', color: '#8a8aaa', font: { size: 9 } },
+                    },
                     y: { ...commonOptions.scales.y, type: 'logarithmic' },
                 },
             },
@@ -756,7 +1006,7 @@
                 scales: {
                     x: {
                         ...commonOptions.scales.x,
-                        title: { display: true, text: '局数', color: '#8a8aaa', font: { size: 9 } },
+                        title: { display: true, text: '局数（每回合最多5局）', color: '#8a8aaa', font: { size: 9 } },
                     },
                     y: {
                         ...commonOptions.scales.y,
@@ -794,7 +1044,7 @@
                 scales: {
                     x: {
                         ...commonOptions.scales.x,
-                        title: { display: true, text: '局数', color: '#8a8aaa', font: { size: 9 } },
+                        title: { display: true, text: '回合数', color: '#8a8aaa', font: { size: 9 } },
                     },
                     y: {
                         ...commonOptions.scales.y,
@@ -824,7 +1074,10 @@
             options: {
                 ...commonOptions,
                 scales: {
-                    x: commonOptions.scales.x,
+                    x: {
+                        ...commonOptions.scales.x,
+                        title: { display: true, text: '训练步数', color: '#8a8aaa', font: { size: 9 } },
+                    },
                     y: {
                         ...commonOptions.scales.y,
                         position: 'left',
@@ -840,10 +1093,24 @@
                 },
             },
         });
+        // Show initial ELO line (1500) when no round data yet
+        if (eloHistory.labels.length === 0) {
+            eloHistory.labels.push(0);
+            eloHistory.red.push(ELO_INITIAL);
+            eloHistory.green.push(ELO_INITIAL);
+            eloHistory.blue.push(ELO_INITIAL);
+            updateEloChart();
+        }
     }
 
     function updateLossChart(metrics) {
-        const label = `${metrics.step || ''}`;
+        if (typeof metrics.step !== 'number' && !Number.isInteger(metrics.step)) return;
+        // Clear stale "Gen X/Y" labels when first numeric step arrives
+        if (lossChart.data.labels.some(l => String(l).startsWith('Gen'))) {
+            lossChart.data.labels = [];
+            lossChart.data.datasets.forEach(d => { d.data = []; });
+        }
+        const label = String(metrics.step);
         lossChart.data.labels.push(label);
         lossChart.data.datasets[0].data.push(metrics.loss);
         lossChart.data.datasets[1].data.push(metrics.loss_value);
@@ -862,7 +1129,13 @@
     }
 
     function updateStatsChart(metrics) {
-        const label = `${metrics.step || ''}`;
+        if (typeof metrics.step !== 'number' && !Number.isInteger(metrics.step)) return;
+        // Clear stale "Gen X/Y" labels when first numeric step arrives
+        if (statsChart.data.labels.some(l => String(l).startsWith('Gen'))) {
+            statsChart.data.labels = [];
+            statsChart.data.datasets.forEach(d => { d.data = []; });
+        }
+        const label = String(metrics.step);
         statsChart.data.labels.push(label);
         statsChart.data.datasets[0].data.push(metrics.avg_game_length || 0);
 

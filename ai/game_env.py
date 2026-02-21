@@ -195,24 +195,51 @@ class EightInARowEnv:
         self._cached_rotated = None  # invalidate rotation cache
 
         # Check win
-        if self._check_win(row, col, pid):
+        max_chain = self._get_max_chain_length(row, col, pid)
+        if max_chain >= self.WIN_LENGTH:
             self.done = True
             self.winner = pid
             self.rank_players()
             reward = 1.0
+        elif not np.any(self._player_planes[3]):
+            # Board full — draw (no empty cells remain)
+            self.done = True
+            self.winner = None
+            self._rank_draw()
+            reward = 0.0
         else:
             reward = 0.0
+            
+            # --- Reward Shaping (Dense Aux Reward) ---
+            # 1. Did we create a WIN_LENGTH - 1 chain? (e.g., 4-in-a-row)
+            if max_chain == self.WIN_LENGTH - 1:
+                reward = 0.05
+            else:
+                # 2. Did we block an opponent's WIN_LENGTH - 1 chain?
+                blocked_threat = False
+                for opp_idx in range(1, self.NUM_PLAYERS):
+                    opp_pid = self.PLAYER_IDS[(self.current_player + opp_idx) % self.NUM_PLAYERS]
+                    self.board[row, col] = opp_pid
+                    opp_chain = self._get_max_chain_length(row, col, opp_pid)
+                    if opp_chain >= self.WIN_LENGTH - 1:
+                        blocked_threat = True
+                self.board[row, col] = pid # Restore state
+                
+                if blocked_threat:
+                    reward = 0.05
+
             self.current_player = (self.current_player + 1) % self.NUM_PLAYERS
 
         return reward, self.done
 
-    def _check_win(self, row: int, col: int, pid: int) -> bool:
-        """Check if placing at (row,col) creates WIN_LENGTH in a row."""
+    def _get_max_chain_length(self, row: int, col: int, pid: int) -> int:
+        """Get the maximum chain length created by placing a piece at (row,col)."""
         directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+        max_chain = 1
         for dr, dc in directions:
             count = 1
             for sign in [1, -1]:
-                for i in range(1, self.WIN_LENGTH):
+                for i in range(1, self.BOARD_SIZE):
                     nr, nc = row + dr * i * sign, col + dc * i * sign
                     if 0 <= nr < self.BOARD_SIZE and 0 <= nc < self.BOARD_SIZE:
                         if self.board[nr, nc] == pid:
@@ -221,9 +248,13 @@ class EightInARowEnv:
                             break
                     else:
                         break
-            if count >= self.WIN_LENGTH:
-                return True
-        return False
+            if count > max_chain:
+                max_chain = count
+        return max_chain
+
+    def _check_win(self, row: int, col: int, pid: int) -> bool:
+        """Check if placing at (row,col) creates WIN_LENGTH in a row."""
+        return self._get_max_chain_length(row, col, pid) >= self.WIN_LENGTH
 
     # ================================================================
     #  Chain Analysis & Ranking
@@ -264,98 +295,64 @@ class EightInARowEnv:
                 
         return threats
 
+    @staticmethod
+    def _rle_profile(mask_1d: np.ndarray) -> Dict[int, int]:
+        """Run-length encode a 1-D boolean array and return {run_length: count}.
+
+        Uses np.diff to find run boundaries in O(1) Python calls.
+        """
+        if mask_1d.size == 0:
+            return {}
+        # Pad with False at both ends so diff always catches start/end of runs
+        padded = np.empty(mask_1d.size + 2, dtype=np.bool_)
+        padded[0] = False
+        padded[-1] = False
+        padded[1:-1] = mask_1d
+        d = np.diff(padded.view(np.int8))
+        starts = np.where(d == 1)[0]
+        ends = np.where(d == -1)[0]
+        if starts.size == 0:
+            return {}
+        lengths = ends - starts
+        counts = np.bincount(lengths)
+        return {int(l): int(counts[l]) for l in range(1, counts.size) if counts[l] > 0}
+
     def compute_chain_profile(self, pid: int) -> Dict[int, int]:
         """Count all consecutive chains for a player in all 4 directions.
 
         Returns a dict {chain_length: count}, e.g. {7: 5, 6: 3, 5: 10}.
         Only chains of length >= 1 are included.
-        Complexity: O(4 * BOARD_SIZE * BOARD_SIZE) ≈ O(40000), very fast.
+
+        Vectorized: uses NumPy run-length encoding instead of Python loops.
         """
-        profile: Dict[int, int] = {}
         board = self.board
         size = self.BOARD_SIZE
+        mask = (board == pid)  # (size, size) bool
 
-        def _record_run(length: int):
-            if length > 0:
-                profile[length] = profile.get(length, 0) + 1
+        profile: Dict[int, int] = {}
 
-        # Horizontal (direction 0,1): scan each row left→right
+        def _merge(sub: Dict[int, int]):
+            for k, v in sub.items():
+                profile[k] = profile.get(k, 0) + v
+
+        # 1. Horizontal: each row is a 1-D sequence
         for r in range(size):
-            run = 0
-            for c in range(size):
-                if board[r, c] == pid:
-                    run += 1
-                else:
-                    _record_run(run)
-                    run = 0
-            _record_run(run)
+            _merge(self._rle_profile(mask[r]))
 
-        # Vertical (direction 1,0): scan each column top→bottom
+        # 2. Vertical: each column is a 1-D sequence
         for c in range(size):
-            run = 0
-            for r in range(size):
-                if board[r, c] == pid:
-                    run += 1
-                else:
-                    _record_run(run)
-                    run = 0
-            _record_run(run)
+            _merge(self._rle_profile(mask[:, c]))
 
-        # Diagonal ↘ (direction 1,1): enumerate all diagonals
-        # Start from row=r, col=0 for r in [0, size)
-        for start_r in range(size):
-            run = 0
-            r, c = start_r, 0
-            while r < size and c < size:
-                if board[r, c] == pid:
-                    run += 1
-                else:
-                    _record_run(run)
-                    run = 0
-                r += 1
-                c += 1
-            _record_run(run)
-        # Start from row=0, col=c for c in [1, size)
-        for start_c in range(1, size):
-            run = 0
-            r, c = 0, start_c
-            while r < size and c < size:
-                if board[r, c] == pid:
-                    run += 1
-                else:
-                    _record_run(run)
-                    run = 0
-                r += 1
-                c += 1
-            _record_run(run)
+        # 3. Diagonal ↘ (offset from -size+1 to size-1)
+        for offset in range(-size + 1, size):
+            diag = np.diag(mask, offset)
+            _merge(self._rle_profile(diag))
 
-        # Anti-diagonal ↙ (direction 1,-1): enumerate all anti-diagonals
-        # Start from row=r, col=size-1
-        for start_r in range(size):
-            run = 0
-            r, c = start_r, size - 1
-            while r < size and c >= 0:
-                if board[r, c] == pid:
-                    run += 1
-                else:
-                    _record_run(run)
-                    run = 0
-                r += 1
-                c -= 1
-            _record_run(run)
-        # Start from row=0, col=c for c in [0, size-2]
-        for start_c in range(size - 2, -1, -1):
-            run = 0
-            r, c = 0, start_c
-            while r < size and c >= 0:
-                if board[r, c] == pid:
-                    run += 1
-                else:
-                    _record_run(run)
-                    run = 0
-                r += 1
-                c -= 1
-            _record_run(run)
+        # 4. Anti-diagonal ↙ (flip columns, then take diagonals)
+        flipped = mask[:, ::-1]
+        for offset in range(-size + 1, size):
+            diag = np.diag(flipped, offset)
+            _merge(self._rle_profile(diag))
 
         return profile
 
@@ -394,6 +391,25 @@ class EightInARowEnv:
             self.rankings.append((pid, i + 1))  # 2nd, 3rd place
 
         # Build placement rewards: {pid: reward}
+        self.placement_rewards = {}
+        for pid, placement in self.rankings:
+            self.placement_rewards[pid] = self.PLACEMENT_REWARDS[placement]
+
+    def _rank_draw(self):
+        """Rank all players when the game ends in a draw (board full, no winner).
+
+        All players are ranked by chain profile (best chains = higher rank).
+        Uses the same placement rewards as normal games.
+        """
+        if not self.done:
+            return
+
+        # Sort all players by chain profile descending
+        player_keys = [(pid, self._chain_sort_key(pid)) for pid in self.PLAYER_IDS]
+        player_keys.sort(key=lambda x: x[1], reverse=True)
+
+        self.rankings = [(pid, i) for i, (pid, _) in enumerate(player_keys)]
+
         self.placement_rewards = {}
         for pid, placement in self.rankings:
             self.placement_rewards[pid] = self.PLACEMENT_REWARDS[placement]

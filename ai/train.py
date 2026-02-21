@@ -105,6 +105,7 @@ def start_ws_server(port: int = 5001):
 
     t = threading.Thread(target=_thread_target, daemon=True)
     t.start()
+    print(f"[Dashboard] WebSocket server on ws://0.0.0.0:{port} — open train_dashboard.html to monitor (pip install websockets if missing)")
 
 
 def broadcast(event_type: str, data: dict):
@@ -198,10 +199,16 @@ def train(config: MuZeroConfig, args):
     # Resume
     if args.resume:
         ckpt_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pt")
+        # Also try train_async.py's checkpoint name
+        if not os.path.exists(ckpt_path):
+            alt_path = os.path.join(config.checkpoint_dir, "latest.pt")
+            if os.path.exists(alt_path):
+                ckpt_path = alt_path
         if os.path.exists(ckpt_path):
             try:
                 print(f"Loading checkpoint: {ckpt_path}")
                 checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+                # Cross-compatible model key: try 'network_state_dict' then 'model'
                 state_dict = checkpoint.get('network_state_dict', checkpoint.get('model'))
                 if state_dict is None:
                     raise KeyError("Checkpoint missing 'network_state_dict' or 'model' key")
@@ -217,12 +224,32 @@ def train(config: MuZeroConfig, args):
                     )
                 model_dict.update(pretrained_dict)
                 network.load_state_dict(model_dict)
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                global_step = checkpoint['global_step']
-                selfplay_iteration = checkpoint['selfplay_iteration']
+
+                # Cross-compatible optimizer key: try 'optimizer_state_dict' then 'optimizer'
+                opt_state = checkpoint.get('optimizer_state_dict', checkpoint.get('optimizer'))
+                if opt_state:
+                    try:
+                        optimizer.load_state_dict(opt_state)
+                    except (ValueError, RuntimeError) as e:
+                        _log.warning("Optimizer state incompatible (architecture changed), resetting: %s", e)
+
+                # Cross-compatible scaler key: try 'scaler_state_dict' then 'scaler'
+                scaler_state = checkpoint.get('scaler_state_dict', checkpoint.get('scaler'))
+                if scaler_state:
+                    try:
+                        scaler.load_state_dict(scaler_state)
+                    except Exception as e:
+                        _log.warning("Scaler state incompatible, resetting: %s", e)
+
+                # Cross-compatible step key: try 'global_step' then 'step'
+                global_step = checkpoint.get('global_step', checkpoint.get('step', 0))
+                selfplay_iteration = checkpoint.get('selfplay_iteration', 0)
                 best_loss = checkpoint.get('best_loss', float('inf'))
+
+                # Cross-compatible stats: try flat keys then 'stats' dict
                 total_games = checkpoint.get('total_games', 0)
+                if total_games == 0 and 'stats' in checkpoint:
+                    total_games = checkpoint['stats'].get('games', 0)
 
                 if memory_bank and 'memory_bank' in checkpoint:
                     memory_bank.load_state_dict(checkpoint['memory_bank'])
@@ -245,6 +272,8 @@ def train(config: MuZeroConfig, args):
                 buf_path = os.path.join(config.checkpoint_dir, "replay_buffer.pkl")
                 if os.path.exists(buf_path):
                     replay_buffer.load(buf_path)
+
+                print(f"Resumed at step={global_step}, games={total_games}")
             except Exception as e:
                 _log.error("Resume failed: %s: %s. Use --no-resume or check checkpoint file.", type(e).__name__, e)
 
@@ -723,16 +752,31 @@ def save_checkpoint(network, optimizer, scheduler, scaler, replay_buffer, memory
                     curriculum=None, league=None):
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     ckpt = {
+        # Primary keys (train.py native)
         'network_state_dict': network.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
-        'memory_bank': memory_bank.state_dict() if memory_bank else None,
         'global_step': step,
         'selfplay_iteration': iteration,
         'best_loss': best_loss,
         'config': vars(config),
         'total_games': total_games,
         'win_counts': win_counts,
+        'memory_bank': memory_bank.state_dict() if memory_bank else None,
+        # Cross-compatible aliases (for train_async.py resume)
+        'model': network.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scaler': scaler.state_dict(),
+        'step': step,
+        'stats': {
+            'games': total_games,
+            'wins': {
+                '1': win_counts.get(1, 0),
+                '2': win_counts.get(2, 0),
+                '3': win_counts.get(3, 0),
+                'draw': win_counts.get('draw', 0),
+            },
+        },
     }
     
     if curriculum:
@@ -744,8 +788,29 @@ def save_checkpoint(network, optimizer, scheduler, scaler, replay_buffer, memory
     if step % 2000 == 0:
         torch.save(ckpt, os.path.join(config.checkpoint_dir, f"checkpoint_{step}.pt"))
     
+    # Async replay buffer save — runs in background to avoid blocking training
     path = os.path.join(config.checkpoint_dir, "replay_buffer.pkl")
-    replay_buffer.save(path)
+    _async_save_replay_buffer(replay_buffer, path)
+
+
+_replay_save_lock = threading.Lock()
+
+def _async_save_replay_buffer(replay_buffer, path: str):
+    """Save replay buffer in a background daemon thread, guarded by a lock."""
+    if not _replay_save_lock.acquire(blocking=False):
+        _log.info("Replay buffer save already in progress, skipping.")
+        return
+    
+    def _save():
+        try:
+            replay_buffer.save(path)
+        except Exception as e:
+            _log.error("Async replay buffer save failed: %s", e)
+        finally:
+            _replay_save_lock.release()
+    
+    t = threading.Thread(target=_save, daemon=True)
+    t.start()
 
 
 # Main boilerplate...

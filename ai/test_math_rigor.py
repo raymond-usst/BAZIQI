@@ -215,7 +215,7 @@ def test_mcts_action_probs_sum_and_root_value_shape():
     # Observation channels = 8 (4 local + 4 global thumbnail per config)
     obs = np.zeros((8, 21, 21), dtype=np.float32)
     legal = np.ones(441, dtype=np.float32)
-    action_probs, root_value = gumbel_muzero_search(network, obs, legal, config, add_noise=False)
+    action_probs, root_value, _root = gumbel_muzero_search(network, obs, legal, config, add_noise=False)
     assert np.isclose(action_probs.sum(), 1.0), f"action_probs sum {action_probs.sum()}"
     assert root_value.shape == (3,), f"root_value shape {root_value.shape}"
 

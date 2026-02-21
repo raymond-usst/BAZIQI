@@ -83,7 +83,7 @@ def test_architecture():
     obs_np = np.random.randn(8, 21, 21).astype(np.float32)
     legal_mask = np.ones(441, dtype=np.float32)
     
-    probs, root_value = gumbel_muzero_search(network, obs_np, legal_mask, config, add_noise=True)
+    probs, root_value, _root = gumbel_muzero_search(network, obs_np, legal_mask, config, add_noise=True)
     print(f"    Action Probs: {probs.shape}, Sum={probs.sum():.2f}, RootValue shape={root_value.shape}")
     assert probs.shape == (441,)
     assert abs(probs.sum() - 1.0) < 1e-3

@@ -65,6 +65,20 @@ class MCTSNode:
         # not by biasing the expected value artificially.
         return self.value_sums / self.visit_count
 
+def _rotate_perspective(node: MCTSNode):
+    """
+    Recursively rotate the value perspective for 3-player games.
+    The value vector is [V_me, V_next, V_prev].
+    When play passes to the next player:
+      - The new 'me' (index 0) is the old 'next' (index 1).
+      - The new 'next' (index 1) is the old 'prev' (index 2).
+      - The new 'prev' (index 2) is the old 'me' (index 0).
+    """
+    node.value_sums = np.array([node.value_sums[1], node.value_sums[2], node.value_sums[0]], dtype=np.float32)
+    for child in node.children.values():
+        _rotate_perspective(child)
+
+
 
 # ============================================================
 #  Gumbel MuZero Search
@@ -76,7 +90,8 @@ def gumbel_muzero_search(network: torch.nn.Module, observation: np.ndarray,
                          noise_scale: float = 1.0,
                          session_context_vec: Optional[np.ndarray] = None,
                          device: Optional[torch.device] = None,
-                         num_simulations_override: Optional[int] = None) -> Tuple[np.ndarray, float]:
+                         num_simulations_override: Optional[int] = None,
+                         reuse_tree: Optional['MCTSNode'] = None) -> Tuple[np.ndarray, float]:
     """
     Gumbel MuZero search using Sequential Halving.
 
@@ -94,9 +109,10 @@ def gumbel_muzero_search(network: torch.nn.Module, observation: np.ndarray,
         add_noise: whether to add Gumbel noise (True for self-play, False for eval)
         session_context_vec: optional (4,) session context vector
         device: optional pre-cached device (avoids repeated next(network.parameters()).device)
+        reuse_tree: optional MCTSNode from previous search to reuse as starting point
 
     Returns:
-        (action_probs, root_value): improved policy distribution and root value estimate
+        (action_probs, root_value, root): improved policy distribution, root value estimate, and MCTS root node
     """
     if device is None:
         device = next(network.parameters()).device
@@ -118,29 +134,42 @@ def gumbel_muzero_search(network: torch.nn.Module, observation: np.ndarray,
     legal_actions = np.where(legal_actions_mask > 0)[0]
 
     if len(legal_actions) == 0:
-        return np.zeros(config.policy_size, dtype=np.float32), root_value
+        return np.zeros(config.policy_size, dtype=np.float32), root_value, None
 
     # ---- Setup root ----
-    root = MCTSNode(prior=0.0)
-    root.hidden_state = hidden_state.squeeze(0)
-    root.value_sums = root_value.copy() # Initialize root value
-    root.visit_count = 1 # Root considered visited 
-    root.expanded = True
+    # Reuse subtree if available (preserves previous evaluations)
+    if reuse_tree is not None and reuse_tree.expanded and reuse_tree.hidden_state is not None:
+        _rotate_perspective(reuse_tree)
+        root = reuse_tree
+        # Re-derive logits from the reused root's children priors for Sequential Halving
+        # We still need fresh logits from network for the improved policy computation
+        logits = policy_logits.squeeze(0).cpu().numpy()
+        # Update root hidden state with fresh inference (view may have shifted)
+        root.hidden_state = hidden_state.squeeze(0)
+    else:
+        root = MCTSNode(prior=0.0)
+        root.hidden_state = hidden_state.squeeze(0)
+        root.value_sums = root_value.copy()
+        root.visit_count = 1
+        root.expanded = True
+
+        logits = policy_logits.squeeze(0).cpu().numpy()
 
     # Mask illegal actions
     masked_logits = np.full(config.policy_size, -1e9, dtype=np.float32)
     masked_logits[legal_actions] = logits[legal_actions]
     priors = _softmax(masked_logits)
 
-    # Create children with prior and raw logit
+    # Create children with prior and raw logit (only for actions not already in tree)
     for a in legal_actions:
-        root.children[int(a)] = MCTSNode(prior=float(priors[a]), logit=float(logits[a]))
+        if int(a) not in root.children:
+            root.children[int(a)] = MCTSNode(prior=float(priors[a]), logit=float(logits[a]))
 
     if len(legal_actions) == 1:
         # Only one legal action
         action_probs = np.zeros(config.policy_size, dtype=np.float32)
         action_probs[legal_actions[0]] = 1.0
-        return action_probs, root_value
+        return action_probs, root_value, root
 
     # ---- Gumbel noise ----
     if add_noise:
@@ -230,7 +259,7 @@ def gumbel_muzero_search(network: torch.nn.Module, observation: np.ndarray,
     if total > 0:
         action_probs /= total
 
-    return action_probs, root_value
+    return action_probs, root_value, root
 
 
 def _batch_simulate_phase(root: MCTSNode, sim_queue: List[Tuple[int, 'MCTSNode']],

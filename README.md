@@ -142,6 +142,7 @@ python -m ai.server [--model checkpoints/best_model.pt] [--port 5000] [--host 0.
 
 - 用浏览器打开项目根目录下的 **train_dashboard.html**，在页面中连接 WebSocket（默认 `ws://localhost:5001`）。
 - 同步训练时需保证 `--ws-port 5001`（或与页面中填写的端口一致）；异步训练默认已开启 5001。
+- **若无法连接**：先安装 `pip install websockets`；若训练在远程或 WSL 运行，将地址改为 `ws://<主机IP>:5001`。
 - 功能：实时自对弈棋盘、累计胜率（红/绿/蓝/平局）、名次分布、训练指标与损失曲线等。
 
 ### 3.6 配置与检查点

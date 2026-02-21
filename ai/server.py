@@ -109,7 +109,7 @@ async def get_move(req: MoveRequest):
             raise HTTPException(status_code=400, detail="No legal moves available")
 
         network.eval()
-        action_probs, _root_value = gumbel_muzero_search(
+        action_probs, _root_value, _root = gumbel_muzero_search(
             network, obs, legal_mask, config,
             add_noise=False
         )
@@ -228,7 +228,7 @@ async def websocket_move(websocket: WebSocket):
         progress_task = asyncio.create_task(send_progress())
         
         try:
-            action_probs, _root_value = await search_task
+            action_probs, _root_value, _root = await search_task
         finally:
             progress_task.cancel()
 

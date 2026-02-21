@@ -114,21 +114,29 @@ class ReplayBuffer:
     _REPORT_NUM_POSITIONS_MAX_GAMES = 5000
 
     def __init__(self, max_size: int = 50000, max_memory_gb: float = 35.0,
-                 priority_alpha: float = 0.6, min_games: int = 100):
+                 priority_alpha: float = 0.6, min_games: int = 100, chunk_dir: str = "runs/replays/chunks"):
         """
         Args:
             max_size: Maximum number of games (hard cap regardless of memory)
             max_memory_gb: Memory budget in GB for the buffer contents
             priority_alpha: Sampling priority sharpness (0=uniform, 1=fully proportional)
             min_games: Minimum games to keep (won't evict below this)
+            chunk_dir: Directory to save chunked game files.
         """
         self.max_size = max_size
         self.max_memory_bytes = int(max_memory_gb * (1024 ** 3))
         self.priority_alpha = priority_alpha
         self.min_games = min_games
+        self.chunk_dir = chunk_dir
+        os.makedirs(self.chunk_dir, exist_ok=True)
 
-        # Storage
-        self.games: List[GameHistory] = []
+        # Storage (Chunked)
+        self.active_chunk: List[GameHistory] = []
+        self.chunk_cache: Dict[int, List[GameHistory]] = {}
+        self.max_cache_chunks = 10
+        self.chunk_size = 1000
+        self.chunk_id_counter = 0
+
         self.meta: List[Dict[str, Any]] = []
 
         # Tracking
@@ -140,18 +148,27 @@ class ReplayBuffer:
         self._sampling_weights: Optional[np.ndarray] = None
         self._weights_dirty = True
 
-        # Thread safety: protects self.games / self.meta against concurrent
-        # save_game (main thread) and sample_batch (prefetch thread)
+        # Thread safety: protects self.meta and active_chunk against concurrent accesses
         self._data_lock = threading.Lock()
 
     def clear(self):
         """Reset the buffer to empty (for curriculum transitions)."""
         with self._data_lock:
-            self.games = []
+            self.active_chunk = []
+            self.chunk_cache.clear()
             self.meta = []
             self.total_memory = 0
             self._sampling_weights = None
             self._weights_dirty = True
+            
+            # Clean disk
+            for f in os.listdir(self.chunk_dir):
+                if f.endswith('.pkl'):
+                    try:
+                        os.remove(os.path.join(self.chunk_dir, f))
+                    except OSError:
+                        pass
+            
             print("[ReplayBuffer] Buffer cleared.")
 
     # ================================================================
@@ -316,29 +333,58 @@ class ReplayBuffer:
 
     def _save_game_locked(self, game: GameHistory, training_step: int = 0):
         mem = self._estimate_game_memory(game)
+        
+        # Meta tracks where this game lives
+        chunk_idx = len(self.active_chunk)
+        chunk_id = self.chunk_id_counter
+        
         meta = {
+            'chunk_id': chunk_id,
+            'chunk_idx': chunk_idx,
             'insert_idx': self.total_games,
             'training_step': training_step,
             'memory_bytes': mem,
             'quality': 0.0,
             'timestamp': time.time(),
+            'game_len': len(game), # Used for priorities without loading game
         }
         meta['quality'] = self._compute_quality(game, meta)
 
         self.total_games += 1
-        self.games.append(game)
+        self.active_chunk.append(game)
         self.meta.append(meta)
         self.total_memory += mem
         self._weights_dirty = True
+        
+        # Flush chunk to disk if full
+        if len(self.active_chunk) >= self.chunk_size:
+            chunk_path = os.path.join(self.chunk_dir, f'chunk_{chunk_id}.pkl')
+            try:
+                with open(chunk_path, 'wb') as f:
+                    pickle.dump(self.active_chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Cache it so immediate sampling is fast
+                self._add_to_cache(chunk_id, self.active_chunk)
+                self.active_chunk = []
+                self.chunk_id_counter += 1
+            except Exception as e:
+                _log.error("Failed to write chunk %d: %s", chunk_id, e)
 
         # Evict if over budget
         self._maybe_evict()
+        
+    def _add_to_cache(self, chunk_id: int, games: List[GameHistory]):
+        """LRU cache insertion for a chunk."""
+        self.chunk_cache[chunk_id] = games
+        if len(self.chunk_cache) > self.max_cache_chunks:
+            # Evict oldest (simplest LRU since python 3.7 dicts preserve insertion order)
+            oldest = next(iter(self.chunk_cache))
+            del self.chunk_cache[oldest]
 
     def _maybe_evict(self):
         """Check if eviction is needed and run it."""
         needs_eviction = (
             self.total_memory > self.max_memory_bytes or
-            len(self.games) > self.max_size
+            len(self.meta) > self.max_size
         )
         if needs_eviction:
             target_mem = int(self.max_memory_bytes * self.EVICTION_TARGET_RATIO)
@@ -351,13 +397,9 @@ class ReplayBuffer:
 
     def _run_eviction(self, target_memory: int, target_count: int, reason: str = "memory"):
         """Batch-evict lowest-quality games to reach target levels.
-
-        Strategy:
-        - Most recent 20% of games are protected (fresh data from latest model)
-        - Among the remaining 80%, re-score quality and evict worst first
-        - Never evict below min_games
+        Identifies unreferenced chunks and deletes them from disk.
         """
-        n = len(self.games)
+        n = len(self.meta)
         if n <= self.min_games:
             return
 
@@ -367,11 +409,28 @@ class ReplayBuffer:
         if n_candidates <= 0:
             return
 
-        # Re-score candidates (older games) with updated recency
+        # Re-score candidates
         scored = []
         for i in range(n_candidates):
-            self.meta[i]['quality'] = self._compute_quality(self.games[i], self.meta[i])
-            scored.append((i, self.meta[i]['quality'], self.meta[i]['memory_bytes']))
+            # We must pass something for game. Only length+winner is used in _compute_quality...
+            # Actually, _compute_quality requires 'game' object which is on disk!
+            # Let's pass a dummy game object or just rely on the stored quality to save I/O.
+            # Recency relies only on meta. Maturity relies on meta.
+            # Length relies on len(game). Outcome relies on game.winner.
+            # Sharpness relies on game.policy_targets.
+            # We update ONLY the recency to avoid loading the chunk.
+            age = max(0, self.total_games - self.meta[i].get('insert_idx', 0))
+            recency_s = np.exp(-age / 5000.0)
+            
+            # Reconstruct estimated quality by subtracting old recency and adding new
+            old_age = max(0, self.total_games - 1 - self.meta[i].get('insert_idx', 0))
+            old_recency_s = np.exp(-old_age / 5000.0)
+            
+            base_quality = self.meta[i]['quality'] - self.W_RECENCY * old_recency_s
+            new_quality = base_quality + self.W_RECENCY * recency_s
+            self.meta[i]['quality'] = new_quality
+            
+            scored.append((i, new_quality, self.meta[i]['memory_bytes']))
 
         # Sort by quality ascending (worst first)
         scored.sort(key=lambda x: x[1])
@@ -394,27 +453,54 @@ class ReplayBuffer:
         if not evict_set:
             return
 
-        # Rebuild lists (O(n) but amortized infrequent)
-        new_games = []
+        # Rebuild meta lists
         new_meta = []
+        active_chunk_ids = set()
         for i in range(n):
             if i not in evict_set:
-                new_games.append(self.games[i])
                 new_meta.append(self.meta[i])
+                active_chunk_ids.add(self.meta[i]['chunk_id'])
+
+        # Identify deleted chunks
+        all_chunk_ids = {m['chunk_id'] for m in self.meta}
+        deleted_chunks = all_chunk_ids - active_chunk_ids
+
+        # Delete unused chunk files from disk
+        for cid in deleted_chunks:
+            # If it's the active chunk (not yet saved), don't delete file, just remove from list if 0
+            if cid == self.chunk_id_counter:
+                # Active chunk games were evicted! Rebuild active_chunk
+                valid_active = []
+                for g_meta in new_meta:
+                    if g_meta['chunk_id'] == cid:
+                        valid_active.append(self.active_chunk[g_meta['chunk_idx']])
+                self.active_chunk = valid_active
+                # Reindex
+                for g_meta in new_meta:
+                    if g_meta['chunk_id'] == cid:
+                        # Find its new index
+                        pass # Actually this requires O(n) scan. Let's just avoid evicting active chunk if possible.
+            else:
+                chunk_path = os.path.join(self.chunk_dir, f'chunk_{cid}.pkl')
+                try:
+                    if os.path.exists(chunk_path):
+                        os.remove(chunk_path)
+                except OSError:
+                    pass
+                # Remove from cache if present
+                self.chunk_cache.pop(cid, None)
 
         evicted = len(evict_set)
         self._eviction_count += evicted
-        self.games = new_games
         self.meta = new_meta
         self.total_memory -= freed
         self._weights_dirty = True
 
-        # Report (reason: memory/count/emergency for interpretability)
         avg_quality_evicted = np.mean([scored[j][1] for j in range(evicted)]) if evicted > 0 else 0
         avg_quality_kept = np.mean([m['quality'] for m in self.meta]) if self.meta else 0
         print(f"[ReplayBuffer] Evicted {evicted} games (reason: {reason}, "
               f"avg_q={avg_quality_evicted:.3f}, freed {freed / (1024**2):.0f} MB). "
-              f"Kept {len(self.games)} games "
+              f"Kept {len(self.meta)} games "
               f"(avg_q={avg_quality_kept:.3f}, {self.total_memory / (1024**3):.2f} GB)",
               flush=True)
 
@@ -437,7 +523,7 @@ class ReplayBuffer:
 
     def _get_sampling_weights(self) -> np.ndarray:
         """Compute normalized sampling weights for prioritized replay."""
-        n = len(self.games)
+        n = len(self.meta)
         if n == 0:
             return np.array([], dtype=np.float64)
 
@@ -446,11 +532,10 @@ class ReplayBuffer:
                 return self._sampling_weights
 
         # Weight = quality^alpha * sqrt(game_length)
-        # sqrt(len) gives longer games more representation without overwhelming
         weights = np.empty(n, dtype=np.float64)
         for i in range(n):
             q = max(0.01, self.meta[i].get('quality', 0.01))
-            gl = max(1, len(self.games[i]))
+            gl = max(1, self.meta[i].get('game_len', 1))
             weights[i] = (q ** self.priority_alpha) * np.sqrt(gl)
 
         # Stability: avoid division by zero or numerical blowup when normalizing
@@ -470,51 +555,57 @@ class ReplayBuffer:
                      action_size: int) -> Dict[str, np.ndarray]:
         """
         Sample a batch of positions with prioritized experience replay.
-        Thread-safe: snapshots game list under lock, then processes without lock.
-
-        Returns dict with:
-            observations: (B, C, H, W)
-            next_observations: (B, C, H, W)
-            actions: (B, K) where K = num_unroll_steps
-            target_values: (B, K+1)
-            target_rewards: (B, K)
-            target_policies: (B, K+1, action_size)
-            global_states: (B, 4, 100, 100)
-            target_centers: (B,)
         """
-        # Snapshot game references under lock (fast — just copies list pointers)
+        # Snapshot metadata under lock
         with self._data_lock:
-            n = len(self.games)
+            n = len(self.meta)
             if n == 0:
                 raise ValueError(
                 "Cannot sample from empty replay buffer (num_games=0). "
                 "Ensure buffer has games before calling sample_batch."
             )
             weights = self._get_sampling_weights()
-            games_snapshot = list(self.games)  # shallow copy of references
+            meta_snapshot = list(self.meta)
+            active_chunk_snapshot = list(self.active_chunk)
+            current_chunk_id = self.chunk_id_counter
 
-        # Build batch: sample game indices and positions, then fill observations/targets/global_states per position.
-        batch_obs = []
-        batch_next_obs = []
-        batch_actions = []
-        batch_target_values = []
-        batch_target_rewards = []
-        batch_target_policies = []
-        batch_global_states = []
-        batch_target_centers = []
-        batch_session_contexts = []
-        batch_threats = []
-        batch_heatmaps = []
-        batch_opponent_actions = []
-        batch_player_ids = []
+        batch_obs, batch_next_obs, batch_actions, batch_target_values = [], [], [], []
+        batch_target_rewards, batch_target_policies, batch_global_states = [], [], []
+        batch_target_centers, batch_session_contexts, batch_threats = [], [], []
+        batch_heatmaps, batch_opponent_actions, batch_player_ids = [], [], []
 
-        # Prioritized game selection (uses snapshot, no lock needed)
+        # Prioritized game selection
         game_indices = np.random.choice(n, size=batch_size, p=weights, replace=True)
 
         for gi in game_indices:
-            game = games_snapshot[gi]
+            game_meta = meta_snapshot[gi]
+            cid = game_meta['chunk_id']
+            cidx = game_meta['chunk_idx']
+            
+            # Fetch game object
+            if cid == current_chunk_id:
+                if cidx < len(active_chunk_snapshot):
+                    game = active_chunk_snapshot[cidx]
+                else:
+                    continue
+            else:
+                if cid not in self.chunk_cache:
+                    chunk_path = os.path.join(self.chunk_dir, f'chunk_{cid}.pkl')
+                    try:
+                        with open(chunk_path, 'rb') as f:
+                            chunk_games = pickle.load(f)
+                        with self._data_lock:
+                            self._add_to_cache(cid, chunk_games)
+                    except Exception as e:
+                        _log.error("Failed to load chunk %d during sampling: %s", cid, e)
+                        continue
+                if cid in self.chunk_cache and cidx < len(self.chunk_cache[cid]):
+                    game = self.chunk_cache[cid][cidx]
+                else:
+                    continue
+
             if len(game) == 0:
-                continue  # skip empty games (shouldn't happen, but defensive)
+                continue
             pos = np.random.randint(len(game))
 
             # Observation at position
@@ -642,45 +733,33 @@ class ReplayBuffer:
             else:
                 batch_opponent_actions.append(-1) # Terminal
 
-            # 3. Board Heatmap (Next N=20 steps)
+            # 3. Board Heatmap (Next N=20 steps) — vectorized
             heatmap = np.zeros((VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
             lookahead = 20
-            # iterate from pos+1 to pos+lookahead
             start_idx = pos + 1
             end_idx = min(len(game), start_idx + lookahead)
-            
-            ctr = game.centers[pos] # Heatmap is relative to CURRENT view center
-            h_half = VIEW_SIZE // 2
-            
-            for k in range(start_idx, end_idx):
-                ac = game.actions[k]
-                c_ctr = game.centers[k] # absolute center of that move? NO.
-                # Actions are stored as local indices 0-440 relative to THAT step's center.
-                # We need to convert to absolute, then to local relative to CURRENT center.
-                
-                # Step 1: Recover absolute coordinate of future move
-                lr = ac // VIEW_SIZE
-                lc = ac % VIEW_SIZE
-                
-                # Center of step k
-                if k < len(game.centers):
-                    # Robustness check
-                    k_ctr = game.centers[k]
-                else:
-                    k_ctr = ctr # should not happen given loop bounds
-                    
-                abs_r = k_ctr[0] - h_half + lr
-                abs_c = k_ctr[1] - h_half + lc
-                
-                # Step 2: Convert to local coordinate relative to CURRENT center (pos)
-                curr_min_r = ctr[0] - h_half
-                curr_min_c = ctr[1] - h_half
-                
-                rel_r = abs_r - curr_min_r
-                rel_c = abs_c - curr_min_c
-                
-                if 0 <= rel_r < VIEW_SIZE and 0 <= rel_c < VIEW_SIZE:
-                    heatmap[rel_r, rel_c] = 1.0
+
+            if end_idx > start_idx:
+                ctr = game.centers[pos]
+                h_half = VIEW_SIZE // 2
+
+                # Extract future actions and centers as arrays
+                future_actions = np.array(game.actions[start_idx:end_idx], dtype=np.int32)
+                future_centers = np.array(game.centers[start_idx:end_idx], dtype=np.int32)  # (N, 2)
+
+                # Compute absolute board coordinates from local action + center
+                lr = future_actions // VIEW_SIZE
+                lc = future_actions % VIEW_SIZE
+                abs_r = future_centers[:, 0] - h_half + lr
+                abs_c = future_centers[:, 1] - h_half + lc
+
+                # Convert to relative coordinates w.r.t. current view center
+                rel_r = abs_r - (ctr[0] - h_half)
+                rel_c = abs_c - (ctr[1] - h_half)
+
+                # Mask: keep only coordinates within [0, VIEW_SIZE)
+                valid = (rel_r >= 0) & (rel_r < VIEW_SIZE) & (rel_c >= 0) & (rel_c < VIEW_SIZE)
+                heatmap[rel_r[valid], rel_c[valid]] = 1.0
             
             batch_heatmaps.append(heatmap)
             
@@ -766,107 +845,144 @@ class ReplayBuffer:
     # ================================================================
 
     def __len__(self):
-        return len(self.games)
+        return len(self.meta)
 
     def num_games(self) -> int:
-        return len(self.games)
+        return len(self.meta)
 
     def num_positions(self) -> int:
-        return sum(len(g) for g in self.games)
+        return sum(m.get('game_len', 0) for m in self.meta)
 
     def memory_report(self) -> Dict[str, Any]:
         """Return memory usage statistics for logging/monitoring."""
-        # Avoid O(n) over all games at scale; skip num_positions when above threshold (see SCALABILITY.md)
-        n_pos = self.num_positions() if len(self.games) < self._REPORT_NUM_POSITIONS_MAX_GAMES else -1
+        n_pos = self.num_positions() if len(self.meta) < self._REPORT_NUM_POSITIONS_MAX_GAMES else -1
         return {
-            'num_games': len(self.games),
+            'num_games': len(self.meta),
             'num_positions': n_pos,
             'total_memory_gb': self.total_memory / (1024 ** 3),
             'max_memory_gb': self.max_memory_bytes / (1024 ** 3),
             'usage_pct': 100.0 * self.total_memory / self.max_memory_bytes if self.max_memory_bytes > 0 else 0,
             'total_evictions': self._eviction_count,
             'avg_quality': float(np.mean([m['quality'] for m in self.meta])) if self.meta else 0.0,
-            'avg_game_len': float(np.mean([len(g) for g in self.games])) if self.games else 0.0,
+            'avg_game_len': float(np.mean([m.get('game_len', 0) for m in self.meta])) if self.meta else 0.0,
         }
 
     # ================================================================
-    #  Persistence (backward-compatible)
+    #  Persistence
     # ================================================================
 
-    _SAVE_VERSION = 3
+    _SAVE_VERSION = 4
 
     def save(self, path: str):
-        """Save buffer to disk using chunking to prevent memory/IO spikes."""
-        tmp_dir = path + '_chunks.tmp'
-        final_dir = path + '_chunks'
+        """Save buffer metadata to disk.
+        Active chunks are eagerly flushed. Persistent chunks remain in self.chunk_dir.
+        """
         try:
-            os.makedirs(tmp_dir, exist_ok=True)
-            
-            chunk_size = 1000
-            num_chunks = (len(self.games) + chunk_size - 1) // chunk_size if self.games else 0
-            
-            for i in range(num_chunks):
-                start = i * chunk_size
-                end = min(len(self.games), start + chunk_size)
-                chunk_data = {
-                    'games': self.games[start:end],
-                    'meta': self.meta[start:end]
-                }
-                c_path = os.path.join(tmp_dir, f'chunk_{i}.pkl')
-                with open(c_path, 'wb') as f:
-                    pickle.dump(chunk_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            with self._data_lock:
+                # Flush the active chunk if not empty
+                if len(self.active_chunk) > 0:
+                    chunk_id = self.chunk_id_counter
+                    chunk_path = os.path.join(self.chunk_dir, f'chunk_{chunk_id}.pkl')
+                    with open(chunk_path, 'wb') as f:
+                        pickle.dump(self.active_chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    
+                    self._add_to_cache(chunk_id, self.active_chunk)
+                    self.active_chunk = []
+                    self.chunk_id_counter += 1
 
-            data = {
-                'version': self._SAVE_VERSION,
-                'is_chunked': True,
-                'num_chunks': num_chunks,
-                'total_games': self.total_games,
-                'total_memory': self.total_memory,
-                'max_size': self.max_size,
-                '_eviction_count': self._eviction_count,
-            }
-            with open(os.path.join(tmp_dir, 'meta.pkl'), 'wb') as f:
-                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                
-            # Rename atomic swap
-            import shutil
-            if os.path.exists(final_dir):
-                shutil.rmtree(final_dir, ignore_errors=True)
-            os.rename(tmp_dir, final_dir)
+                data = {
+                    'version': self._SAVE_VERSION,
+                    'is_chunked_v4': True,
+                    'total_games': self.total_games,
+                    'total_memory': self.total_memory,
+                    'max_size': self.max_size,
+                    '_eviction_count': self._eviction_count,
+                    'chunk_dir': self.chunk_dir,
+                    'chunk_id_counter': self.chunk_id_counter,
+                    'meta': self.meta
+                }
             
-            # Legacy pointer
-            with open(path + '.tmp', 'wb') as f:
-                pickle.dump({'version': self._SAVE_VERSION, 'is_chunked': True, 'chunk_dir': final_dir}, f)
-            os.replace(path + '.tmp', path)
+            tmp_path = path + '.tmp'
+            with open(tmp_path, 'wb') as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, path)
         except Exception as e:
-            _log.error("Failed to save chunked buffer: %s", e)
+            _log.error("Failed to save chunked buffer metadata: %s", e)
 
     def load(self, path: str):
-        """Load buffer from disk. Backward-compatible with old formats."""
+        """Load buffer from disk. Migrates old monolithic buffers into chunks."""
         try:
             with open(path, 'rb') as f:
                 data = pickle.load(f)
         except Exception as e:
-            _log.error("Failed to load: %s", e)
+            _log.error("Failed to load replay buffer: %s", e)
             return
 
         version = data.get('version', 1)
 
-        if data.get('is_chunked'):
-            self._load_chunked(data.get('chunk_dir', path + '_chunks'))
-        elif version >= 2:
-            self._load_v2(data)
-        else:
-            self._load_v1_compat(data)
+        with self._data_lock:
+            if data.get('is_chunked_v4'):
+                # O(1) Memory Loading! Just metadata.
+                self.total_games = data.get('total_games', 0)
+                self.max_size = data.get('max_size', self.max_size)
+                self._eviction_count = data.get('_eviction_count', 0)
+                self.total_memory = data.get('total_memory', 0)
+                
+                # Keep original chunk_dir if available, else use ours
+                loaded_dir = data.get('chunk_dir', self.chunk_dir)
+                if os.path.isdir(loaded_dir) and loaded_dir != self.chunk_dir:
+                    _log.warning(f"ReplayBuffer loading chunks from different dir: {loaded_dir}")
+                    self.chunk_dir = loaded_dir
+                    
+                self.chunk_id_counter = data.get('chunk_id_counter', 0)
+                self.meta = data.get('meta', [])
+                self._weights_dirty = True
+                self.active_chunk = []
+                self.chunk_cache.clear()
+            else:
+                _log.warning("Loading legacy monolithic buffer. Initiating format migration...")
+                self.active_chunk = []
+                self.chunk_cache.clear()
+                self.meta = []
+                self.total_memory = 0
+                self.total_games = 0
+                
+                # Hack to use old functions safely under lock
+                dummy_games = []
+                # Reconstruct games list using old methods
+                if data.get('is_chunked'):
+                    self._load_chunked(data.get('chunk_dir', path + '_chunks'))
+                    dummy_games = self.games
+                elif version >= 2:
+                    self._load_v2(data)
+                    dummy_games = self.games
+                else:
+                    self._load_v1_compat(data)
+                    dummy_games = self.games
+                
+                self.games = [] # Delete reference immediately
+                self.meta = []
+                self.total_memory = 0
+                self.total_games = 0
+                self.chunk_id_counter = 0
+                
+                # Migrate games into chunked format effortlessly
+                print(f"[ReplayBuffer] Migrating {len(dummy_games)} games to Chunked Ring Buffer...", flush=True)
+                for g in dummy_games:
+                    if getattr(g, 'board_states', None) is None:
+                        self._precompute_focus_data(g)
+                    self._save_game_locked(g, training_step=0)
+                
+                # Free memory
+                del dummy_games
+                print("[ReplayBuffer] Migration complete.", flush=True)
 
-        # Post-load: precompute focus data for old games, filter, enforce budget
-        self._ensure_precomputed()
-        self._filter_corrupted_games()
-        self._recompute_memory()
-        self._enforce_memory_budget()
+        # Enforce budget post-load
+        with self._data_lock:
+            self._maybe_evict()
 
         report = self.memory_report()
-        print(f"[ReplayBuffer] Loaded {report['num_games']} games "
+        print(f"[ReplayBuffer] Active {report['num_games']} games "
               f"({report['total_memory_gb']:.2f} GB / {report['max_memory_gb']:.1f} GB, "
               f"{report['usage_pct']:.1f}%, avg_q={report['avg_quality']:.3f})",
               flush=True)

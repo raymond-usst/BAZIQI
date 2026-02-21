@@ -101,6 +101,16 @@ body {
     font-size: 0.8rem;
 }
 
+.connection-hint {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-left: 4px;
+    max-width: 420px;
+}
+.connection-hint.hidden {
+    display: none;
+}
+
 .btn {
     padding: 5px 14px;
     border: 1px solid var(--border-subtle);
@@ -364,6 +374,40 @@ body {
     color: var(--accent-glow);
     font-weight: 600;
     background: rgba(108, 92, 231, 0.1);
+}
+
+/* ---- Toggle Buttons ---- */
+.toggle-group {
+    display: flex;
+    gap: 2px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 6px;
+    padding: 2px;
+    border: 1px solid var(--border-subtle);
+}
+
+.toggle-btn {
+    padding: 2px 10px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.72rem;
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    transition: all 0.2s;
+}
+
+.toggle-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.toggle-btn.active {
+    background: rgba(108, 92, 231, 0.3);
+    color: var(--accent-glow);
+    box-shadow: 0 1px 4px rgba(108, 92, 231, 0.2);
 }
 
 /* ---- Bottom Charts Grid (Stats + ELO side by side) ---- */

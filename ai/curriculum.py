@@ -72,6 +72,13 @@ class CurriculumManager:
         self.stage_start_elo = None
         # LCB must exceed this to ensure above random (e.g. 0.50)
         self.baseline_wr = getattr(config, 'curriculum_baseline_wr', 0.50)
+
+        # Probation: regression protection after graduation
+        self.in_probation = False
+        self.probation_win_buffer: List[float] = []
+        self.probation_games = getattr(config, 'curriculum_probation_games', 500)
+        self.probation_wr_floor = getattr(config, 'curriculum_probation_wr_floor', 0.40)
+        self._pre_probation_state: Optional[Dict[str, Any]] = None
         
     def _create_stage(self, stage_id, size, win_len, wr):
         # Dynamic Game Count Formula: N_k = N_1 * (S_k / S_1)^alpha
@@ -121,6 +128,26 @@ class CurriculumManager:
         self.win_rate_buffer.append(s)
         if len(self.win_rate_buffer) > 1000:
             self.win_rate_buffer.pop(0)
+
+        # Probation check: track win rate after graduation
+        if self.in_probation:
+            self.probation_win_buffer.append(s)
+            if len(self.probation_win_buffer) >= self.probation_games:
+                avg = np.mean(self.probation_win_buffer)
+                if avg < self.probation_wr_floor:
+                    _log.warning(
+                        "Probation FAILED: avg WR %.3f < floor %.3f after %d games. Reverting to previous stage.",
+                        avg, self.probation_wr_floor, len(self.probation_win_buffer)
+                    )
+                    self._revert_from_probation()
+                else:
+                    _log.info(
+                        "Probation PASSED: avg WR %.3f >= floor %.3f. Stage confirmed.",
+                        avg, self.probation_wr_floor
+                    )
+                    self.in_probation = False
+                    self.probation_win_buffer = []
+                    self._pre_probation_state = None
 
     def record_loss(self, loss: float):
         """
@@ -242,8 +269,11 @@ class CurriculumManager:
         return True
         
     def advance(self, league=None):
-        """Advance to next stage. If league is provided, records current_elo as stage_start_elo for the new stage."""
+        """Advance to next stage with probation. Saves pre-advance state for potential rollback."""
         if self.current_stage_idx < len(self.stages) - 1:
+            # Save state for rollback if probation fails
+            self._pre_probation_state = self.state_dict()
+            
             self.current_stage_idx += 1
             self.games_in_stage = 0
             self.win_rate_buffer = []
@@ -252,8 +282,23 @@ class CurriculumManager:
             self._loss_ema = None
             if league is not None:
                 self.stage_start_elo = getattr(league, 'current_elo', None)
+            
+            # Enter probation
+            self.in_probation = True
+            self.probation_win_buffer = []
+            _log.info("Advanced to Stage %d. Entering probation (%d games, floor=%.2f).",
+                      self.current_stage_idx + 1, self.probation_games, self.probation_wr_floor)
             return self.get_current_stage()
         return None
+
+    def _revert_from_probation(self):
+        """Revert to pre-graduation state when probation fails."""
+        if self._pre_probation_state is not None:
+            self.load_state_dict(self._pre_probation_state)
+            self._pre_probation_state = None
+            self.in_probation = False
+            self.probation_win_buffer = []
+            _log.info("Reverted to Stage %d after probation failure.", self.current_stage_idx + 1)
         
     def state_dict(self) -> Dict[str, Any]:
         """Return the current state of the curriculum."""
@@ -265,6 +310,9 @@ class CurriculumManager:
             'stage_start_elo': self.stage_start_elo,
             'loss_ema_buffer': getattr(self, 'loss_ema_buffer', []),
             '_loss_ema': getattr(self, '_loss_ema', None),
+            'in_probation': self.in_probation,
+            'probation_win_buffer': self.probation_win_buffer,
+            '_pre_probation_state': self._pre_probation_state,
         }
 
     def _ensure_number_list(self, val: Any, name: str, max_len: int = 5000) -> List[float]:
@@ -305,5 +353,12 @@ class CurriculumManager:
                     self._loss_ema = None
             except (TypeError, ValueError):
                 self._loss_ema = None
+        # Probation state
+        self.in_probation = bool(state_dict.get('in_probation', False))
+        self.probation_win_buffer = self._ensure_number_list(
+            state_dict.get('probation_win_buffer'), 'probation_win_buffer', max_len=1000
+        )
+        self._pre_probation_state = state_dict.get('_pre_probation_state', None)
         self.current_stage_idx = max(0, min(self.current_stage_idx, len(self.stages) - 1))
-        _log.info("State loaded: Stage %d, Games %d", self.current_stage_idx + 1, self.games_in_stage)
+        _log.info("State loaded: Stage %d, Games %d, Probation=%s",
+                  self.current_stage_idx + 1, self.games_in_stage, self.in_probation)

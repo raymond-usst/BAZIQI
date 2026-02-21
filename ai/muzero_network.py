@@ -35,6 +35,9 @@ class DynamicsNetwork(nn.Module):
             nn.Linear(fc_hidden, hidden_state_dim),
         )
         
+        # Residual skip projection: ensures identity-like mapping by default
+        self.skip_proj = nn.Linear(hidden_state_dim * 2, hidden_state_dim)
+        
         self.reward_net = nn.Sequential(
             nn.Linear(hidden_state_dim * 2, fc_hidden),
             nn.LayerNorm(fc_hidden),
@@ -49,7 +52,7 @@ class DynamicsNetwork(nn.Module):
         action_emb = self.action_embed(action_onehot)
         combined = torch.cat([hidden_state, action_emb], dim=1)
         
-        next_state = self.state_net(combined)
+        next_state = self.state_net(combined) + self.skip_proj(combined)
         # Normalize hidden state to unit sphere
         next_state = next_state / (next_state.norm(dim=1, keepdim=True) + 1e-8)
         
@@ -205,6 +208,7 @@ class FocusNetwork(nn.Module):
     Predicts the optimal view center (normalized r, c) from the global board state.
     Input: (B, 4, 100, 100)
     Output: (B, 2) values in [0, 1]
+    Uses Spatial Softmax instead of FC+Sigmoid for enhanced numerical stability.
     """
     def __init__(self, channels: int = 4):
         super().__init__()
@@ -218,20 +222,32 @@ class FocusNetwork(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2), # 13x13
             nn.BatchNorm2d(64),
             nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=1) # 13x13 heat map
         )
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 2),
-            nn.Sigmoid() # Output 0..1
-        )
+        
+        # Create normalized coordinate grid for 13x13
+        grid_size = 13
+        coords = (torch.arange(grid_size, dtype=torch.float32) + 0.5) / grid_size
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
+        
+        self.register_buffer('grid_x', grid_x.reshape(1, -1)) # (1, 169)
+        self.register_buffer('grid_y', grid_y.reshape(1, -1)) # (1, 169)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = self.gap(x)
-        x = x.flatten(1)
-        return self.fc(x)
+        heatmap = self.conv(x) # (B, 1, 13, 13)
+        B = heatmap.shape[0]
+        
+        heatmap_flat = heatmap.reshape(B, -1) # (B, 169)
+        
+        # Stable Softmax along spatial dimensions
+        orig_dtype = heatmap_flat.dtype
+        prob = F.softmax(heatmap_flat.float(), dim=-1).to(orig_dtype)
+        
+        # Compute expected coordinates (r=y, c=x)
+        expected_y = (prob * self.grid_y).sum(dim=1, keepdim=True)
+        expected_x = (prob * self.grid_x).sum(dim=1, keepdim=True)
+        
+        return torch.cat([expected_y, expected_x], dim=1)
 
 
 class MuZeroNetwork(nn.Module):
