@@ -225,27 +225,30 @@ class FocusNetwork(nn.Module):
             nn.Conv2d(64, 1, kernel_size=1) # 13x13 heat map
         )
         
-        # Create normalized coordinate grid for 13x13
-        grid_size = 13
-        coords = (torch.arange(grid_size, dtype=torch.float32) + 0.5) / grid_size
-        grid_y, grid_x = torch.meshgrid(coords, coords, indexing='ij')
-        
-        self.register_buffer('grid_x', grid_x.reshape(1, -1)) # (1, 169)
-        self.register_buffer('grid_y', grid_y.reshape(1, -1)) # (1, 169)
+        # Create normalized coordinate grid for 13x13 (removed static buffer)
+        pass
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        heatmap = self.conv(x) # (B, 1, 13, 13)
-        B = heatmap.shape[0]
+        heatmap = self.conv(x) # (B, 1, H, W)
+        B, C, H, W = heatmap.shape
         
-        heatmap_flat = heatmap.reshape(B, -1) # (B, 169)
+        heatmap_flat = heatmap.reshape(B, -1) # (B, H*W)
         
         # Stable Softmax along spatial dimensions
         orig_dtype = heatmap_flat.dtype
         prob = F.softmax(heatmap_flat.float(), dim=-1).to(orig_dtype)
         
+        # Dynamically generate coordinate grids matching the downsampled spatial dims
+        coords_y = (torch.arange(H, dtype=torch.float32, device=x.device) + 0.5) / H
+        coords_x = (torch.arange(W, dtype=torch.float32, device=x.device) + 0.5) / W
+        grid_y, grid_x = torch.meshgrid(coords_y, coords_x, indexing='ij')
+        
+        grid_y = grid_y.reshape(1, -1) # (1, H*W)
+        grid_x = grid_x.reshape(1, -1) # (1, H*W)
+        
         # Compute expected coordinates (r=y, c=x)
-        expected_y = (prob * self.grid_y).sum(dim=1, keepdim=True)
-        expected_x = (prob * self.grid_x).sum(dim=1, keepdim=True)
+        expected_y = (prob * grid_y).sum(dim=1, keepdim=True)
+        expected_x = (prob * grid_x).sum(dim=1, keepdim=True)
         
         return torch.cat([expected_y, expected_x], dim=1)
 
@@ -295,6 +298,16 @@ class MuZeroNetwork(nn.Module):
             )
         else:
             self.consistency = None
+            
+        # 4. State Reconstruction Head (Decoder)
+        # Reconstructs the (8, 21, 21) local observation from the hidden state.
+        # This acts as a strong self-supervised regularization.
+        self.state_decoder = nn.Sequential(
+            nn.Linear(config.hidden_state_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Linear(512, 8 * config.local_view_size * config.local_view_size)
+        )
 
         # 4. Dynamics & Prediction
         self.dynamics = DynamicsNetwork(config.hidden_state_dim, config.policy_size, config.fc_hidden)
@@ -391,6 +404,13 @@ class MuZeroNetwork(nn.Module):
         if self.consistency:
             return self.consistency.projector(hidden_state)
         return hidden_state # fallback (shouldn't happen if config correct)
+
+    def reconstruct_state(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Reconstruct the local observation from the hidden state."""
+        B = hidden_state.shape[0]
+        flat_obs = self.state_decoder(hidden_state)
+        vs = self.config.local_view_size
+        return flat_obs.view(B, 8, vs, vs)
 
     def predict_projection(self, projected_state: torch.Tensor) -> torch.Tensor:
         """Predict expected projection (SimSiam predictor)."""

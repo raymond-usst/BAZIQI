@@ -166,6 +166,10 @@ class InferenceServer:
         
         _log.info(f"IPC Inference Server started at {self.endpoint} (batch={self.batch_size}, timeout={self.timeout_ms}ms)")
         
+        total_batches = 0
+        total_items = 0
+        last_log_time = time.time()
+        
         while self.running:
             # Check for incoming requests
             pending = {}
@@ -205,6 +209,16 @@ class InferenceServer:
                 for op, reqs in pending.items():
                     addrs = [req[0] for req in reqs]
                     payloads = [self._parse_tensors(req[1]) for req in reqs]
+                    
+                    # Tracking batch sizes
+                    total_batches += 1
+                    total_items += sum([p[0].shape[0] for p in payloads])
+                    
+                    if time.time() - last_log_time > 10.0:
+                        _log.info(f"IPC Avg Batch Size: {total_items / max(1, total_batches):.1f}")
+                        total_batches = 0
+                        total_items = 0
+                        last_log_time = time.time()
                     
                     if op == OP_INITIAL:
                         # payloads are [[obs, ctx], [obs, ctx], ...]

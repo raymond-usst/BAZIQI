@@ -96,7 +96,6 @@ def test_architecture():
         game = GameHistory()
         for i in range(10):
             game.store(
-                np.random.randn(8, 21, 21).astype(np.float32),
                 np.random.randint(0, 441),
                 0.0,
                 np.ones(441, dtype=np.float32) / 441,
@@ -136,4 +135,10 @@ def test_architecture():
     print("    Success.")
 
 if __name__ == '__main__':
-    test_architecture()
+    try:
+        test_architecture()
+    except Exception as e:
+        import traceback
+        with open('crash.txt', 'w') as f:
+            traceback.print_exc(file=f)
+        raise

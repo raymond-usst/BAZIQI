@@ -278,7 +278,7 @@ def load_model(model_path: str, use_cuda: bool = True):
     global network, config, device
 
     config = MuZeroConfig()
-    config.num_simulations = config.num_simulations_play
+    config.num_simulations_start = config.num_simulations_end = config.num_simulations_play
     config.validate()
 
     device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")

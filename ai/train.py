@@ -372,15 +372,18 @@ def train(config: MuZeroConfig, args):
             continue
 
         network.train()
-        losses = {'total': [], 'value': [], 'reward': [], 'policy': [], 'consistency': [], 'policy_entropy': []}
+        losses = {'total': [], 'value': [], 'reward': [], 'policy': [], 'consistency': [], 'focus': [], 'recon': [], 'policy_entropy': []}
 
         steps_this_iter = min(config.training_steps_per_iter, target_steps - global_step)
         print(f"   Training: {steps_this_iter} steps...", end='', flush=True)
 
         # Efficiency: sync train does not prefetch; use train_async for higher throughput.
         for _ in range(steps_this_iter):
+            progress = min(1.0, global_step / max(1, getattr(config, 'progression_steps', 100000)))
+            current_batch_size = int(getattr(config, 'batch_size_start', 128) + (getattr(config, 'batch_size_end', 1024) - getattr(config, 'batch_size_start', 128)) * progress)
+            
             batch = replay_buffer.sample_batch(
-                config.batch_size, config.num_unroll_steps,
+                current_batch_size, config.num_unroll_steps,
                 config.td_steps, config.discount, config.policy_size
             )
             if getattr(config, 'augment_board', False):
@@ -407,7 +410,7 @@ def train(config: MuZeroConfig, args):
                                 curriculum, league)
 
         avg_loss = np.mean(losses['total'])
-        print(f" done. Loss: {avg_loss:.4f} (C={np.mean(losses['consistency']):.4f})")
+        print(f" done. Loss: {avg_loss:.4f} (C={np.mean(losses['consistency']):.4f}, F={np.mean(losses.get('focus', [0])): .4f}, Rec={np.mean(losses.get('recon', [0])): .4f})")
         
         curriculum.record_loss(avg_loss)
         
@@ -434,6 +437,12 @@ def train(config: MuZeroConfig, args):
         metrics = {
             'step': global_step,
             'loss': float(avg_loss),
+            'loss_value': float(np.mean(losses['value'])),
+            'loss_reward': float(np.mean(losses['reward'])),
+            'loss_policy': float(np.mean(losses['policy'])),
+            'loss_consistency': float(np.mean(losses['consistency'])),
+            'loss_focus': float(np.mean(losses.get('focus', [0]))),
+            'loss_recon': float(np.mean(losses.get('recon', [0]))),
             'lr': scheduler.get_last_lr()[0],
             'total_games': total_games,
             'win_counts': {str(k): v for k, v in win_counts.items()},
@@ -455,7 +464,33 @@ def _update_memory_bank(memory_bank, game, network, device, config):
     indices = range(0, len(game), 5)
     if len(indices) == 0: return
 
-    obs_batch = np.array([game.observations[i] for i in indices])
+    from ai.game_env import EightInARowEnv
+    from ai.self_play import _get_observation_and_mask
+    import numpy as np
+    env = EightInARowEnv(board_size=getattr(game, 'board_size', config.board_size), 
+                         win_length=getattr(game, 'win_length', config.win_length))
+    env.reset()
+    h_half = config.local_view_size // 2
+    obs_dict = {}
+    
+    max_idx = max(indices)
+    for i in range(max_idx + 1):
+        if i in indices:
+            ctr = game.centers[i]
+            rotated = env._get_rotated_planes_cached()
+            legal = env.legal_moves_local(ctr[0], ctr[1], config.local_view_size)
+            legal_mask = np.zeros(config.policy_size, dtype=np.float32)
+            for lr, lc in legal:
+                legal_mask[lr * config.local_view_size + lc] = 1.0
+            obs, _, _ = _get_observation_and_mask(env, config, ctr[0], ctr[1], legal_mask, rotated)
+            obs_dict[i] = obs
+            
+        act = game.actions[i]
+        ctr = game.centers[i]
+        lr, lc = act // config.local_view_size, act % config.local_view_size
+        env.step(ctr[0] - h_half + lr, ctr[1] - h_half + lc)
+        
+    obs_batch = np.array([obs_dict[i] for i in indices])
     obs_tensor = torch.from_numpy(obs_batch).to(device)
     
     with torch.no_grad():
@@ -570,7 +605,7 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
     if not accumulate:
         optimizer.zero_grad()
 
-    with torch.amp.autocast('cuda', enabled=False):  # fp32 only — fp16 caused NaN overflow
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):  # Enable BF16 Mixed Precision for 30-50% speedup
         # 1. Initial Representation
         hidden_state = network.representation(obs)
 
@@ -611,12 +646,21 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
         loss_p_raw = -(target_policies[:, 0] * log_probs).sum(dim=1) * mask
         loss_p = loss_p_raw.sum() / mask_sum
 
+        # Track per-sample TD Error for Prioritized Experience Replay
+        td_errors = (loss_v_raw.sum(dim=-1) + loss_p_raw).detach()
+
         # Interpretability: batch mean policy entropy (root step)
         probs = F.softmax(policy_logits, dim=1)
         policy_entropy = -(probs * F.log_softmax(policy_logits, dim=1)).sum(dim=1).mean().item()
 
         loss_r = torch.zeros_like(loss_v)
         loss_c = torch.zeros_like(loss_v)
+        
+        # --- State Reconstruction Loss ---
+        recon_obs = network.reconstruct_state(hidden_state)
+        # obs is (B, 8, 21, 21) where planes are binary floats
+        loss_recon_raw = F.mse_loss(recon_obs, obs, reduction='none').mean(dim=[1, 2, 3]) * mask
+        loss_recon = loss_recon_raw.sum() / mask_sum
         
         # --- Auxiliary Losses (calculated only at root step k=0) ---
         # 1. Threat Detection (BCE)
@@ -670,19 +714,23 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
             next_state.register_hook(lambda grad, s=_gs: grad * s)
 
             # 3. Consistency Loss (EfficientZero)
-            # Apply only on K=0, every 3 training steps (saves one full Backbone pass)
-            if config.use_consistency and k == 0 and (step_counter % 3 == 0):
+            # Apply on K=0 to anchor the dynamics trajectory
+            if config.use_consistency and k == 0:
                 next_obs = _to_dev('next_observations')
                 with torch.no_grad():
                     h_real = network.representation(next_obs)
                 # Compare projected predicted state vs projected real state
-                # Scale up by 3x to compensate for being applied 1/3 of the time
-                loss_c_raw = network.consistency(next_state, h_real, reduction='none') * gradient_scale * 3.0 * mask
+                loss_c_raw = network.consistency(next_state, h_real, reduction='none') * gradient_scale * mask
                 loss_c += loss_c_raw.sum() / mask_sum
 
+            # --- Lightweight Value Reanalyze ---
+            # Blend stale historical MCTS target with fresh network prediction
+            # This provides Reanalyze benefits (updating stale targets) with zero MCTS cost
+            with torch.no_grad():
+                fresh_value = value.detach()
+                reanalyzed_target = 0.5 * target_values[:, k + 1] + 0.5 * fresh_value
                 
-                
-            loss_v_raw = F.mse_loss(value, target_values[:, k + 1], reduction='none') * mask_bc
+            loss_v_raw = F.mse_loss(value, reanalyzed_target, reduction='none') * mask_bc
             loss_v += (loss_v_raw.sum() / mask_sum) * gradient_scale
             
             loss_r_raw = F.mse_loss(reward, target_rewards[:, k], reduction='none') * mask
@@ -696,19 +744,22 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
             loss_p_raw = -(target_policies[:, k + 1] * log_probs).sum(dim=-1) * mask
             loss_p += (loss_p_raw.sum() / mask_sum) * gradient_scale
             
+            td_errors += (loss_v_raw.sum(dim=-1) + loss_r_raw + loss_p_raw).detach() * gradient_scale
+            
             curr_state = next_state
 
         # Weighting: Focus loss should be significant but not overwhelm
         # Maybe 0.1 or 1.0 depending on magnitude. CE is typically 2-5 initially.
         # Let's use 0.5 for now.
-        total_loss = loss_v + loss_r + loss_p + config.lambda_consistency * loss_c + 0.5 * loss_f + loss_aux
+        # Recon loss is MSE over binary planes, so it's bounded [0, 1]. We weight it to match other losses.
+        total_loss = loss_v + loss_r + loss_p + config.lambda_consistency * loss_c + 0.5 * loss_f + loss_aux + 2.0 * loss_recon
 
     # ── NaN guard: skip step if loss is NaN/Inf ──
     # Always zero_grad on NaN regardless of accumulate, to prevent poison gradients
     if torch.isnan(total_loss) or torch.isinf(total_loss):
         optimizer.zero_grad()
         return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
-                'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, '_nan': True}
+                'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, 'recon': 0.0, '_nan': True}
 
     scaler.scale(total_loss * accum_scale).backward()
 
@@ -725,7 +776,7 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
             optimizer.zero_grad()  # always clear poison gradients
             scaler.update()
             return {'total': float('nan'), 'value': 0.0, 'reward': 0.0,
-                    'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, '_nan': True}
+                    'policy': 0.0, 'consistency': 0.0, 'focus': 0.0, 'policy_entropy': 0.0, 'recon': 0.0, '_nan': True, 'td_errors': None}
 
         torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=getattr(config, 'max_grad_norm', 10.0))
         scaler.step(optimizer)
@@ -734,7 +785,9 @@ def train_step(network, optimizer, scaler, batch, config, device, memory_bank,
     return {'total': total_loss.item(), 'value': loss_v.item(),
             'reward': loss_r.item(), 'policy': loss_p.item(),
             'consistency': loss_c.item(), 'focus': loss_f.item(),
-            'aux': loss_aux.item(), 'policy_entropy': policy_entropy}
+            'recon': loss_recon.item(),
+            'aux': loss_aux.item(), 'policy_entropy': policy_entropy,
+            'td_errors': td_errors.cpu().numpy()}
 
 
 def _policy_loss(logits, targets):
@@ -859,10 +912,10 @@ def main():
     print(f"Configuration: Board {config.board_size}x{config.board_size}, Win Length {config.win_length}")
 
     if args.cpu: config.device = 'cpu'
-    if args.batch_size: config.batch_size = args.batch_size
+    if args.batch_size: config.batch_size_start = config.batch_size_end = args.batch_size
     if args.lr: config.learning_rate = args.lr
     if args.selfplay_games: config.selfplay_games_per_iter = args.selfplay_games
-    if args.simulations: config.num_simulations = args.simulations
+    if args.simulations: config.num_simulations_start = config.num_simulations_end = args.simulations
     if args.min_buffer: config.min_buffer_size = args.min_buffer
     
     config.checkpoint_dir = args.checkpoint_dir

@@ -43,8 +43,9 @@ class MuZeroConfig:
     consistency_proj_dim: int = 256
 
     # --- Gumbel MuZero MCTS ---
-    num_simulations: int = 100      # default (mid-game) during training — 2x for cleaner policy targets
-    num_simulations_play: int = 100 # during human vs AI
+    num_simulations_start: int = 25     # early training (rapid iteration)
+    num_simulations_end: int = 200      # late training (deep lookahead)
+    num_simulations_play: int = 100     # during human vs AI
     num_simulations_early: int = 32  # opening (step < 10): fewer sims, simple positions
     num_simulations_mid: int = 100   # mid-game (10-40): full depth search
     num_simulations_late: int = 50   # late-game (40+): positions more determined
@@ -78,7 +79,9 @@ class MuZeroConfig:
     koth_period: int = 10000        # switch active trainer every N steps
 
     # --- Training ---
-    batch_size: int = 512           # large batch for GPU saturation (RTX 4090 16GB)
+    batch_size_start: int = 128     # early training
+    batch_size_end: int = 1024      # late training (max GPU saturation)
+    progression_steps: int = 100000 # steps over which batch_size and num_simulations scale up
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     lr_decay_steps: int = 100000
@@ -108,7 +111,7 @@ class MuZeroConfig:
     # --- IPC Batched Inference ---
     use_ipc_inference: bool = False     # Use ZeroMQ IPC for batched self-play inference
     ipc_batch_size: int = 64            # Target batch size for inference server
-    ipc_timeout_ms: float = 2.0         # Max wait (ms) before processing partial batch
+    ipc_timeout_ms: float = 8.0         # Max wait (ms) before processing partial batch
 
     # --- Scale / train_async ---
     max_game_steps: int = 5000          # Cap per-game steps in self-play to avoid runaway (see SCALABILITY.md)
@@ -153,9 +156,9 @@ class MuZeroConfig:
             raise ValueError(
                 f"learning_rate should be in [1e-6, 1.0], got {self.learning_rate}."
             )
-        if self.batch_size < 1 or self.batch_size > 10000:
+        if self.batch_size_start < 1 or self.batch_size_end > 10000:
             raise ValueError(
-                f"batch_size should be in [1, 10000], got {self.batch_size}."
+                f"batch_size should be in [1, 10000]."
             )
         if self.replay_buffer_size < 1 or self.replay_buffer_size > 2_000_000:
             raise ValueError(

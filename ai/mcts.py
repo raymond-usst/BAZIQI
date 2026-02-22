@@ -184,7 +184,11 @@ def gumbel_muzero_search(network: torch.nn.Module, observation: np.ndarray,
 
     # ---- Sequential Halving ----
     max_considered = min(config.gumbel_max_considered_actions, len(legal_actions))
-    num_simulations = num_simulations_override if num_simulations_override is not None else config.num_simulations
+    num_simulations = num_simulations_override if num_simulations_override is not None else getattr(config, 'num_simulations_start', 25)
+
+    if reuse_tree is not None:
+        min_sims = max(getattr(config, 'min_simulations', 10), num_simulations // 2)
+        num_simulations = max(min_sims, num_simulations - reuse_tree.visit_count)
 
     # Start with top-m actions by Gumbel score
     sorted_actions = sorted(gumbel_logits.keys(),

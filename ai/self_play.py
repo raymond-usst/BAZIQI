@@ -165,9 +165,14 @@ def play_game(network: Union[torch.nn.Module, Dict[int, torch.nn.Module]], confi
 
     # Efficiency: cache config lookups once per game to avoid getattr in the step loop.
     temperature_drop_step = getattr(config, 'temperature_drop_step', 0)
-    sims_early = getattr(config, 'num_simulations_early', config.num_simulations)
-    sims_mid = getattr(config, 'num_simulations_mid', config.num_simulations)
-    sims_late = getattr(config, 'num_simulations_late', config.num_simulations)
+    progress = min(1.0, training_step / max(1, getattr(config, 'progression_steps', 100000)))
+    sims_start = getattr(config, 'num_simulations_start', 25)
+    sims_end = getattr(config, 'num_simulations_end', 200)
+    base_sims = int(sims_start + (sims_end - sims_start) * progress)
+    
+    sims_early = getattr(config, 'num_simulations_early', max(8, base_sims // 3))
+    sims_mid = getattr(config, 'num_simulations_mid', base_sims)
+    sims_late = getattr(config, 'num_simulations_late', max(16, base_sims // 2))
     policy_target_temp_start = getattr(config, 'policy_target_temp_start', 1.0)
     policy_target_temp_end = getattr(config, 'policy_target_temp_end', 1.0)
     policy_target_temp_steps = getattr(config, 'policy_target_temp_steps', 100000)
@@ -182,6 +187,15 @@ def play_game(network: Union[torch.nn.Module, Dict[int, torch.nn.Module]], confi
     # Exponential Temperature Decay & Elo-Modulation
     # -------------------------------------------------------------
     base_temp = temperature
+    
+    # Global training-step based exploration annealing
+    explore_start = getattr(config, 'explore_temp_start', temperature)
+    explore_end = getattr(config, 'explore_temp_end', 0.2)
+    explore_steps = getattr(config, 'explore_temp_steps', 200000)
+    
+    if explore_steps > 0 and explore_start != explore_end:
+        progress = min(1.0, training_step / explore_steps)
+        base_temp = explore_start + (explore_end - explore_start) * progress
     if pbt_elo is not None:
         # PBT dynamic feedback: if losing (Elo drop), increase exploration. If mastering, exploit.
         if pbt_elo < 1200:
@@ -260,7 +274,7 @@ def play_game(network: Union[torch.nn.Module, Dict[int, torch.nn.Module]], confi
 
             # Threats + store in history
             threats = env.get_threat_levels()
-            history.store(obs, action, 0.0, target_probs, root_value, threats, player_id, center)
+            history.store(action, 0.0, target_probs, root_value, threats, player_id, center)
 
             # 3. Validate and execute action
             board_r, board_c, action_was_legal, reward, should_break = _validate_and_step(

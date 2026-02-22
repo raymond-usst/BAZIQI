@@ -1,0 +1,28 @@
+Traceback (most recent call last):
+  File "D:\code\trifeet_v2\ai\smoke_test.py", line 139, in <module>
+    test_architecture()
+  File "D:\code\trifeet_v2\ai\smoke_test.py", line 50, in test_architecture
+    h, p, v = network.initial_inference(obs, mem_keys, mem_vals)
+  File "D:\code\trifeet_v2\ai\muzero_network.py", line 365, in initial_inference
+    hidden_state = self.representation(obs)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "D:\code\trifeet_v2\ai\transformer_backbone.py", line 314, in forward
+    tokens = self.patch_embed(obs)  # (B, L, d_model)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "D:\code\trifeet_v2\ai\transformer_backbone.py", line 229, in forward
+    patches = self.proj(x)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\conv.py", line 554, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+  File "C:\Users\47041\.tf210\lib\site-packages\torch\nn\modules\conv.py", line 549, in _conv_forward
+    return F.conv2d(
+RuntimeError: Given groups=1, weight of size [64, 8, 3, 3], expected input[2, 4, 21, 21] to have 8 channels, but got 4 channels instead

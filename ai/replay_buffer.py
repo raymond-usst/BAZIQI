@@ -27,7 +27,6 @@ class GameHistory:
     SNAPSHOT_INTERVAL = 10  # Save board snapshot every N steps
 
     def __init__(self):
-        self.observations: List[np.ndarray] = []       # local observations
         self.actions: List[int] = []                     # local action indices
         self.rewards: List[float] = []                   # immediate rewards
         self.policy_targets: List[np.ndarray] = []       # MCTS visit distributions
@@ -49,8 +48,6 @@ class GameHistory:
         # {step_index: board_copy_int8_100x100}
         self.board_snapshots: Dict[int, np.ndarray] = {}
         # Precomputed focus data (computed once at save_game time)
-        # board_states[i] = int8(100,100) board BEFORE move i (perspective-agnostic)
-        self.board_states: Optional[List[np.ndarray]] = None
         # target_centers_precomputed[i] = int index (row*100+col) of the actual move at step i
         self.target_centers_precomputed: Optional[List[int]] = None
         
@@ -60,11 +57,10 @@ class GameHistory:
         # Final board state (for visualization); set at end of self-play
         self.final_board: Optional[np.ndarray] = None
 
-    def store(self, observation: np.ndarray, action: int, reward: float,
+    def store(self, action: int, reward: float,
               policy: np.ndarray, root_value: np.ndarray, threats: np.ndarray,
               player_id: int, center: Tuple[int, int]):
-        """Append one step: observation, action, reward, policy target, root value, threats, player_id, center."""
-        self.observations.append(observation)
+        """Append one step: action, reward, policy target, root value, threats, player_id, center."""
         self.actions.append(action)
         self.rewards.append(reward)
         self.policy_targets.append(policy)
@@ -74,7 +70,7 @@ class GameHistory:
         self.centers.append(center)
 
     def __len__(self):
-        return len(self.observations)
+        return len(self.actions)
 
 
 class ReplayBuffer:
@@ -183,20 +179,15 @@ class ReplayBuffer:
             return 256  # Minimal empty-object overhead
 
         # Numpy array sizes (measured from actual data)
-        obs_bytes = sum(o.nbytes for o in game.observations)
         policy_bytes = sum(p.nbytes for p in game.policy_targets)
 
         # Board snapshots (100x100 int8 = 10KB each)
         snapshots = getattr(game, 'board_snapshots', {})
         snapshot_bytes = sum(s.nbytes for s in snapshots.values()) if snapshots else 0
 
-        # Precomputed board states (sparse dict or legacy per-position list)
-        board_states = getattr(game, 'board_states', None)
-        if board_states:
-            if isinstance(board_states, dict):
-                precomputed_bytes = sum(b.nbytes for b in board_states.values())
-            else:
-                precomputed_bytes = sum(b.nbytes for b in board_states)
+        target_centers = getattr(game, 'target_centers_precomputed', None)
+        if target_centers is not None and len(target_centers) > 0:
+            precomputed_bytes = len(target_centers) * 8
         else:
             precomputed_bytes = 0
 
@@ -211,7 +202,7 @@ class ReplayBuffer:
         # Additional metadata fields (rankings, placement_rewards, session_scores, etc.)
         metadata_bytes = 256
 
-        return obs_bytes + policy_bytes + snapshot_bytes + precomputed_bytes + scalar_bytes + metadata_bytes + base_overhead
+        return policy_bytes + snapshot_bytes + precomputed_bytes + scalar_bytes + metadata_bytes + base_overhead
 
     # ================================================================
     #  Quality Scoring
@@ -248,7 +239,7 @@ class ReplayBuffer:
 
         # ── 4. Policy sharpness: low entropy = decisive MCTS ──
         sharpness_s = 0.5  # Default if can't compute
-        if game.policy_targets and game_len > 0:
+        if len(game.policy_targets) > 0 and game_len > 0:
             try:
                 sample_idx = np.linspace(0, game_len - 1, min(5, game_len), dtype=int)
                 entropies = []
@@ -275,32 +266,21 @@ class ReplayBuffer:
 
     @staticmethod
     def _precompute_focus_data(game: GameHistory):
-        """Precompute sparse board snapshots and target_centers for every position.
-
-        Called once at save_game() time.  Board snapshots are saved every
-        SNAPSHOT_INTERVAL steps (like the existing board_snapshots dict)
-        to avoid massive memory usage on long games (1400+ moves).
-        Target centers are stored for ALL positions (negligible: 8 bytes each).
+        """Precompute target_centers for every position.
+        Called once at save_game() time.
+        Target centers are stored for ALL positions (negligible).
         """
         BOARD_SIZE = getattr(game, 'board_size', 100)
         VIEW_SIZE = 21
         HALF = VIEW_SIZE // 2
-        SNAP_INTERVAL = GameHistory.SNAPSHOT_INTERVAL  # 10
         n = len(game)
         if n == 0:
-            game.board_states = {}   # sparse dict: {step: int8(100,100)}
             game.target_centers_precomputed = []
             return
 
-        board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
-        board_snapshots: Dict[int, np.ndarray] = {}
         target_centers = []
 
         for i in range(n):
-            # Save sparse snapshot at interval boundaries
-            if i % SNAP_INTERVAL == 0:
-                board_snapshots[i] = board.copy()
-
             # Compute target center (global board coords of the actual move)
             act = game.actions[i]
             ctr = game.centers[i]
@@ -312,26 +292,28 @@ class ReplayBuffer:
             tc = max(0, min(BOARD_SIZE - 1, tc))
             target_centers.append(tr * BOARD_SIZE + tc)
 
-            # Apply move to board (for next position's state)
-            br = ctr[0] - HALF + lr
-            bc = ctr[1] - HALF + lc
-            pid = game.player_ids[i]
-            if 0 <= br < BOARD_SIZE and 0 <= bc < BOARD_SIZE:
-                board[br, bc] = pid
-
-        game.board_states = board_snapshots  # sparse: ~1/10 of positions
         game.target_centers_precomputed = target_centers
 
     def save_game(self, game: GameHistory, training_step: int = 0):
         """Add a completed game with quality scoring and memory-aware eviction.
         Thread-safe: acquires _data_lock to protect games/meta lists."""
-        # Precompute focus data BEFORE locking (CPU work, no shared state)
-        if game.board_states is None:
+        # Precompute focus target centers BEFORE locking
+        if game.target_centers_precomputed is None:
             self._precompute_focus_data(game)
         with self._data_lock:
             self._save_game_locked(game, training_step)
 
     def _save_game_locked(self, game: GameHistory, training_step: int = 0):
+        # 1. Compress game lists into minimal numpy arrays identically to save space
+        if len(game.actions) > 0 and isinstance(game.actions, list):
+            game.actions = np.array(game.actions, dtype=np.int32)
+            game.rewards = np.array(game.rewards, dtype=np.float16)
+            game.policy_targets = np.array(game.policy_targets, dtype=np.float16)
+            game.root_values = np.array(game.root_values, dtype=np.float16)
+            game.threats = np.array(game.threats, dtype=np.float16)
+            game.player_ids = np.array(game.player_ids, dtype=np.int8)
+            game.target_centers_precomputed = np.array(game.target_centers_precomputed, dtype=np.int32)
+
         mem = self._estimate_game_memory(game)
         
         # Meta tracks where this game lives
@@ -572,7 +554,7 @@ class ReplayBuffer:
         batch_obs, batch_next_obs, batch_actions, batch_target_values = [], [], [], []
         batch_target_rewards, batch_target_policies, batch_global_states = [], [], []
         batch_target_centers, batch_session_contexts, batch_threats = [], [], []
-        batch_heatmaps, batch_opponent_actions, batch_player_ids = [], [], []
+        batch_heatmaps, batch_opponent_actions, batch_player_ids, batch_insert_idxs = [], [], [], []
 
         # Prioritized game selection
         game_indices = np.random.choice(n, size=batch_size, p=weights, replace=True)
@@ -608,14 +590,10 @@ class ReplayBuffer:
                 continue
             pos = np.random.randint(len(game))
 
-            # Observation at position
-            batch_obs.append(game.observations[pos])
-
-            # Next observation (t+1) for consistency loss
-            if pos + 1 < len(game):
-                batch_next_obs.append(game.observations[pos + 1])
-            else:
-                batch_next_obs.append(game.observations[pos])
+            # Provide a dummy observation here, we will replace this block using reconstruction logic
+            # below after the board is reconstructed.
+            batch_obs.append(None)
+            batch_next_obs.append(None)
 
             # Unroll targets
             actions = []
@@ -658,17 +636,12 @@ class ReplayBuffer:
             HALF = VIEW_SIZE // 2
             
             # Find nearest precomputed snapshot and replay at most ~SNAP_INTERVAL steps
-            snapshots = game.board_states  # sparse dict {step: board}
             snap_interval = GameHistory.SNAPSHOT_INTERVAL
             snap_step = (pos // snap_interval) * snap_interval
 
-            if isinstance(snapshots, dict) and snap_step in snapshots:
-                current_board = snapshots[snap_step].copy()
+            if snap_step in game.board_snapshots:
+                current_board = game.board_snapshots[snap_step].copy()
                 replay_start = snap_step
-            elif isinstance(snapshots, list) and pos < len(snapshots):
-                # Legacy per-position list format (backward compat)
-                current_board = snapshots[pos]
-                replay_start = pos  # no replay needed
             else:
                 current_board = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
                 replay_start = 0
@@ -685,10 +658,95 @@ class ReplayBuffer:
                 if 0 <= br < BOARD_SIZE and 0 <= bc < BOARD_SIZE:
                     current_board[br, bc] = pid
 
-            # Efficiency: vectorized global state (no per-cell Python loop).
+            # --- Dynamic Sub-Observation Reconstruction ---
+            # Now that current_board perfectly matches the exact 100x100 global state at `pos`:
             current_pid = game.player_ids[pos]
             next_pid = (current_pid % 3) + 1
             prev_pid = ((current_pid + 1) % 3) + 1
+            
+            # Create rotated planes dict based on the board exactly as get_observation() expects
+            rotated_planes = {
+                1: (current_board == current_pid),
+                2: (current_board == next_pid),
+                3: (current_board == prev_pid),
+                0: (current_board == 0),
+            }
+            
+            from ai.game_env import EightInARowEnv
+            if not hasattr(self, '_obs_env'):
+                self._obs_env = EightInARowEnv(board_size=BOARD_SIZE)
+            
+            # Since get_observation expects `env.board`, we recreate the view dynamically
+            # without carrying an `env` instance by manually cropping the planes:
+            cpos = game.centers[pos]
+            r_start = cpos[0] - HALF
+            c_start = cpos[1] - HALF
+            
+            # Build the 4x21x21 local obs matrix entirely synthetically
+            chans = []
+            for plane_key in [1, 2, 3, 0]: # ME, NEXT, PREV, EMPTY
+                plane = rotated_planes[plane_key]
+                padded_plane = np.pad(plane, pad_width=HALF, mode='constant', constant_values=0)
+                # Translate original coordinates to padded coordinates
+                p_r_start = r_start + HALF
+                p_c_start = c_start + HALF
+                crop = padded_plane[p_r_start : p_r_start + VIEW_SIZE, p_c_start : p_c_start + VIEW_SIZE]
+                chans.append(crop)
+            obs_local = np.stack(chans, axis=0).astype(np.float32)
+            
+            # Global thumbnail
+            rot_stack = np.stack([rotated_planes[1], rotated_planes[2], rotated_planes[3], rotated_planes[0]], axis=0).astype(np.float32)
+            obs_global = self._obs_env._numpy_area_pool(rot_stack)
+            obs_array = np.concatenate([obs_local, obs_global], axis=0)
+            
+            # Replace the dummy None we pushed earlier
+            batch_obs[-1] = obs_array
+            
+            # Repeat reconstruction for `pos + 1` (next_obs) if not terminal
+            if pos + 1 < len(game):
+                # Apply move `pos` to global board
+                act = game.actions[pos]
+                ctr = game.centers[pos]
+                lr = act // VIEW_SIZE
+                lc = act % VIEW_SIZE
+                br = ctr[0] - HALF + lr
+                bc = ctr[1] - HALF + lc
+                if 0 <= br < BOARD_SIZE and 0 <= bc < BOARD_SIZE:
+                    current_board[br, bc] = current_pid
+                
+                # Next player context
+                next_active_pid = game.player_ids[pos + 1]
+                n_next_pid = (next_active_pid % 3) + 1
+                n_prev_pid = ((next_active_pid + 1) % 3) + 1
+                rotated_planes_next = {
+                    1: (current_board == next_active_pid),
+                    2: (current_board == n_next_pid),
+                    3: (current_board == n_prev_pid),
+                    0: (current_board == 0),
+                }
+                cpos_next = game.centers[pos + 1]
+                r_start_n = cpos_next[0] - HALF
+                c_start_n = cpos_next[1] - HALF
+                
+                chans_n = []
+                for plane_key in [1, 2, 3, 0]:
+                    plane_n = rotated_planes_next[plane_key]
+                    padded_plane_n = np.pad(plane_n, pad_width=HALF, mode='constant', constant_values=0)
+                    p_r_start_n = r_start_n + HALF
+                    p_c_start_n = c_start_n + HALF
+                    crop_n = padded_plane_n[p_r_start_n : p_r_start_n + VIEW_SIZE, p_c_start_n : p_c_start_n + VIEW_SIZE]
+                    chans_n.append(crop_n)
+                obs_local_next = np.stack(chans_n, axis=0).astype(np.float32)
+                
+                rot_stack_next = np.stack([rotated_planes_next[1], rotated_planes_next[2], rotated_planes_next[3], rotated_planes_next[0]], axis=0).astype(np.float32)
+                obs_global_next = self._obs_env._numpy_area_pool(rot_stack_next)
+                obs_next_array = np.concatenate([obs_local_next, obs_global_next], axis=0)
+                
+                batch_next_obs[-1] = obs_next_array
+            else:
+                batch_next_obs[-1] = obs_array
+
+            # Efficiency: vectorized global state (no per-cell Python loop).
 
             glob_state = np.stack([
                 (current_board == current_pid),
@@ -765,6 +823,7 @@ class ReplayBuffer:
             
             # KOTH Support: Add player_id of current move
             batch_player_ids.append(game.player_ids[pos])
+            batch_insert_idxs.append(game_meta.get('insert_idx', -1))
 
         return {
             'observations': np.array(batch_obs, dtype=np.float32),
@@ -780,7 +839,99 @@ class ReplayBuffer:
             'target_opponent_actions': np.array(batch_opponent_actions, dtype=np.int64),
             'target_heatmaps': np.array(batch_heatmaps, dtype=np.float32),
             'player_ids': np.array(batch_player_ids, dtype=np.int64),
+            'insert_idxs': np.array(batch_insert_idxs, dtype=np.int64),
         }
+
+    def update_priorities(self, insert_idxs: np.ndarray, errors: np.ndarray):
+        """Update quality score of games based on TD errors from training."""
+        with self._data_lock:
+            max_errs = {}
+            for idx, err in zip(insert_idxs, errors):
+                if idx >= 0:
+                    max_errs[idx] = max(max_errs.get(idx, 0.0), float(err))
+                    
+            if not max_errs:
+                return
+                
+            updated = False
+            # Reverse iterate as sampled games are statistically more likely to be recent
+            for m in reversed(self.meta):
+                idx = m.get('insert_idx', -1)
+                if idx in max_errs:
+                    # Blend old quality with TD error proxy
+                    # TD error is typically > 0. We clip at 1.0 to fit the quality [0, 1] scheme.
+                    m['quality'] = 0.5 * m.get('quality', 0.5) + 0.5 * min(1.0, max_errs[idx])
+                    updated = True
+                    del max_errs[idx]
+                    if not max_errs:
+                        break
+            
+            if updated:
+                self._weights_dirty = True
+
+    def sample_game_for_reanalyze(self) -> Optional[Tuple[int, 'GameHistory']]:
+        """Fetch a random old game from the buffer for MCTS reanalysis.
+        Returns: (insert_idx, GameHistory) or None if buffer empty.
+        """
+        with self._data_lock:
+            if not self.meta:
+                return None
+            
+            # Prefer older games for reanalysis (where policy was weak)
+            # Sample uniformly from the older 80% of the buffer
+            max_idx = max(1, int(len(self.meta) * 0.8))
+            meta_idx = np.random.randint(0, max_idx)
+            
+            game_meta = self.meta[meta_idx]
+            cid = game_meta['chunk_id']
+            cidx = game_meta['chunk_idx']
+            insert_idx = game_meta.get('insert_idx', -1)
+
+            if cid == self.chunk_id_counter: # In active chunk
+                if cidx < len(self.active_chunk):
+                    return insert_idx, self.active_chunk[cidx]
+            else: # On disk
+                if cid not in self.chunk_cache:
+                    chunk_path = os.path.join(self.chunk_dir, f'chunk_{cid}.pkl')
+                    try:
+                        with open(chunk_path, 'rb') as f:
+                            chunk_games = pickle.load(f)
+                        self._add_to_cache(cid, chunk_games)
+                    except Exception as e:
+                        _log.error("Failed to load chunk %d for reanalyze: %s", cid, e)
+                        return None
+                if cid in self.chunk_cache and cidx < len(self.chunk_cache[cid]):
+                    return insert_idx, self.chunk_cache[cid][cidx]
+        return None
+
+    def update_game_by_insert_idx(self, insert_idx: int, new_game: 'GameHistory'):
+        """Replace an old game with a reanalyzed version.
+        Instead of in-place disk modification, logically deletes the old entry
+        and appends the new game to the active chunk.
+        """
+        if insert_idx < 0:
+            return
+            
+        with self._data_lock:
+            old_meta_idx = -1
+            for i, m in enumerate(self.meta):
+                if m.get('insert_idx') == insert_idx:
+                    old_meta_idx = i
+                    break
+                    
+            if old_meta_idx == -1:
+                return # Game already evicted during reanalysis
+
+            old_meta = self.meta[old_meta_idx]
+            
+            # Logically delete old game memory footprint
+            self.total_memory -= old_meta['memory_bytes']
+            self.meta.pop(old_meta_idx)
+        
+        # Save as a fresh game
+        # Note: training_step sets recency. We use total_games so it's fresh.
+        self.save_game(new_game, training_step=self.total_games)
+
 
     def _compute_value_target(self, game: GameHistory, pos: int,
                               td_steps: int, discount: float) -> np.ndarray:

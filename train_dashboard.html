@@ -22,7 +22,8 @@
             <span id="ws-label">未连接</span>
             <input id="ws-url" type="text" value="ws://localhost:5001" placeholder="ws://localhost:5001" />
             <button id="btn-connect" class="btn">连接</button>
-            <span id="connection-hint" class="connection-hint">先启动训练 (python -m ai.train_async ...)，默认端口 5001；远程请填 ws://主机IP:5001</span>
+            <span id="connection-hint" class="connection-hint">先启动训练 (python -m ai.train_async ...)，默认端口 5001；远程请填
+                ws://主机IP:5001</span>
         </div>
     </header>
 
@@ -55,7 +56,8 @@
                             <button class="toggle-btn active" id="wr-mode-game"
                                 onclick="window.__dashToggle('winrate','game')" title="按单局统计（全局）">每局</button>
                             <button class="toggle-btn" id="wr-mode-round"
-                                onclick="window.__dashToggle('winrate','round')" title="按回合统计（每完成一轮 Best-of-5 计 1 回合）">每回合</button>
+                                onclick="window.__dashToggle('winrate','round')"
+                                title="按回合统计（每完成一轮 Best-of-5 计 1 回合）">每回合</button>
                         </div>
                         <span id="total-games" class="badge">0 局</span>
                     </div>
@@ -99,7 +101,8 @@
                             <button class="toggle-btn active" id="plc-mode-game"
                                 onclick="window.__dashToggle('placement','game')" title="按单局统计（全局）">每局</button>
                             <button class="toggle-btn" id="plc-mode-round"
-                                onclick="window.__dashToggle('placement','round')" title="按回合统计（每完成一轮 Best-of-5 计 1 回合）">每回合</button>
+                                onclick="window.__dashToggle('placement','round')"
+                                title="按回合统计（每完成一轮 Best-of-5 计 1 回合）">每回合</button>
                         </div>
                         <span id="placement-total" class="badge">0 局</span>
                     </div>
@@ -146,7 +149,7 @@
                 </section>
 
                 <!-- Session Scores Chart -->
-                <section id="scores-panel" class="panel" title="五局三胜·每回合从 0 累计">
+                <section id="scores-panel" class="panel" title="五局三胜·按回合数展示累计积分">
                     <div class="panel-header">
                         <h2>🏅 累计积分曲线</h2>
                         <span id="session-info" class="badge">会话: -</span>

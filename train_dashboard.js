@@ -342,7 +342,7 @@
                 break;
 
             case 'metrics_history':
-                // Bulk load history
+                // Bulk load history — fully restore ALL dashboard state
                 if (msg.data && msg.data.length > 0) {
                     console.log(`Loaded ${msg.data.length} metrics history entries.`);
 
@@ -351,23 +351,36 @@
                         updateLossChart(m);
                         updateStatsChart(m);
                     });
-
-                    // 2. Refresh charts once
                     lossChart.update();
                     statsChart.update();
 
-                    // 3. Restore win stats from last entry
+                    // 2. Restore win/round stats from last entry
                     const last = msg.data[msg.data.length - 1];
-                    if (last.total_games) totalGames = last.total_games;
+                    if (last.total_games !== undefined) totalGames = last.total_games;
                     if (last.win_counts) winCounts = { ...winCounts, ...last.win_counts };
+                    if (last.total_rounds !== undefined) {
+                        totalRounds = last.total_rounds;
+                        lastSeenTotalRounds = last.total_rounds; // prevent fake trigger
+                    }
+                    if (last.round_wins) {
+                        roundWinCounts = {
+                            1: last.round_wins['1'] || 0,
+                            2: last.round_wins['2'] || 0,
+                            3: last.round_wins['3'] || 0,
+                            draw: last.round_wins['draw'] || 0,
+                        };
+                    }
+                    if (last.round_placements) {
+                        for (const pid of [1, 2, 3]) {
+                            const arr = last.round_placements[String(pid)] || [0, 0, 0];
+                            roundPlacementCounts[pid] = [arr[0] || 0, arr[1] || 0, arr[2] || 0];
+                        }
+                    }
                     updateWinRates();
                     updateSummaryBar(last);
 
-                    // 4. Restore placements, scores chart & ELO from history
-                    //    Find entries with placement data and replay them
-                    //    Reset ELO to initial before replaying
+                    // 3. Restore placements & score chart from history
                     eloRatings = { 1: ELO_INITIAL, 2: ELO_INITIAL, 3: ELO_INITIAL };
-                    lastEloRankedGames = 0;
                     eloHistory.labels.length = 0;
                     eloHistory.red.length = 0;
                     eloHistory.green.length = 0;
@@ -377,9 +390,15 @@
                     scoreHistory.green.length = 0;
                     scoreHistory.blue.length = 0;
 
+                    let prevTotalRoundsH = 0;
+                    let prevRankedGamesH = 0;
+                    let prevCumPoints = { 1: 0, 2: 0, 3: 0 };
+                    let basePointsH = { 1: 0, 2: 0, 3: 0 };
+                    let baseRankedH = 0;
+
                     for (const entry of msg.data) {
+                        // Placement & cumulative points
                         if (entry.placements && entry.ranked_games) {
-                            // Sync placement counts
                             rankedGames = entry.ranked_games;
                             for (let pid = 1; pid <= 3; pid++) {
                                 const counts = entry.placements[String(pid)] || [0, 0, 0];
@@ -388,21 +407,72 @@
                                     + counts[1] * PLACEMENT_POINTS[1]
                                     + counts[2] * PLACEMENT_POINTS[2];
                             }
-                            // ELO not replayed from history (per-round ELO has no round boundaries in history)
 
-                            // Push to score history
-                            scoreHistory.labels.push(entry.ranked_games);
-                            scoreHistory.red.push(cumulativePoints[1]);
-                            scoreHistory.green.push(cumulativePoints[2]);
-                            scoreHistory.blue.push(cumulativePoints[3]);
-                            if (scoreHistory.labels.length > MAX_SCORE_POINTS) {
-                                scoreHistory.labels.shift();
-                                scoreHistory.red.shift();
-                                scoreHistory.green.shift();
-                                scoreHistory.blue.shift();
+                            const entryRounds = entry.total_rounds || 0;
+
+                            // Push cumulative score keyed by round
+                            const lastLabel = scoreHistory.labels.length > 0 ? scoreHistory.labels[scoreHistory.labels.length - 1] : -1;
+                            if (entryRounds === lastLabel) {
+                                scoreHistory.red[scoreHistory.red.length - 1] = cumulativePoints[1];
+                                scoreHistory.green[scoreHistory.green.length - 1] = cumulativePoints[2];
+                                scoreHistory.blue[scoreHistory.blue.length - 1] = cumulativePoints[3];
+                            } else if (entryRounds > lastLabel) {
+                                scoreHistory.labels.push(entryRounds);
+                                scoreHistory.red.push(cumulativePoints[1]);
+                                scoreHistory.green.push(cumulativePoints[2]);
+                                scoreHistory.blue.push(cumulativePoints[3]);
+                                if (scoreHistory.labels.length > MAX_SCORE_POINTS) {
+                                    scoreHistory.labels.shift();
+                                    scoreHistory.red.shift();
+                                    scoreHistory.green.shift();
+                                    scoreHistory.blue.shift();
+                                }
+                            }
+
+                            if (entryRounds > prevTotalRoundsH) {
+                                basePointsH = { 1: prevCumPoints[1], 2: prevCumPoints[2], 3: prevCumPoints[3] };
+                                baseRankedH = prevRankedGamesH;
+                                prevTotalRoundsH = entryRounds;
+                            }
+
+                            prevCumPoints = { 1: cumulativePoints[1], 2: cumulativePoints[2], 3: cumulativePoints[3] };
+                            prevRankedGamesH = entry.ranked_games;
+                        }
+
+                        // ELO: push league_elo as history point at each round change
+                        if (entry.total_rounds && entry.league_elo !== undefined && entry.total_rounds > (eloHistory.labels.length > 0 ? eloHistory.labels[eloHistory.labels.length - 1] : -1)) {
+                            eloHistory.labels.push(entry.total_rounds);
+                            eloHistory.red.push(entry.league_elo);
+                            // Approximate other players from round placements
+                            const rp = entry.round_placements;
+                            if (rp) {
+                                const p2first = (rp['2'] || [0, 0, 0])[0];
+                                const p3first = (rp['3'] || [0, 0, 0])[0];
+                                const tr = entry.total_rounds || 1;
+                                eloHistory.green.push(ELO_INITIAL + (p2first / tr - 0.33) * 400);
+                                eloHistory.blue.push(ELO_INITIAL + (p3first / tr - 0.33) * 400);
+                            } else {
+                                eloHistory.green.push(ELO_INITIAL);
+                                eloHistory.blue.push(ELO_INITIAL);
+                            }
+                            if (eloHistory.labels.length > MAX_ELO_POINTS) {
+                                eloHistory.labels.shift();
+                                eloHistory.red.shift();
+                                eloHistory.green.shift();
+                                eloHistory.blue.shift();
                             }
                         }
                     }
+
+                    // Set baselines from restored state
+                    roundBaselinePoints = { 1: basePointsH[1], 2: basePointsH[2], 3: basePointsH[3] };
+                    roundBaselineRankedGames = baseRankedH;
+                    roundPoints = {
+                        1: cumulativePoints[1] - roundBaselinePoints[1],
+                        2: cumulativePoints[2] - roundBaselinePoints[2],
+                        3: cumulativePoints[3] - roundBaselinePoints[3],
+                    };
+                    roundGameIndex = rankedGames - roundBaselineRankedGames;
 
                     // Update all displays
                     updatePlacementDisplay();
@@ -444,6 +514,7 @@
          * Overwrite local placement/score state with authoritative data from all actors.
          * Also computes within-round points for score chart.
          */
+        const originalIndex = roundGameIndex;
         rankedGames = serverRankedGames;
         for (let pid = 1; pid <= 3; pid++) {
             const counts = serverPlacements[String(pid)] || [0, 0, 0];
@@ -453,9 +524,20 @@
                 + counts[2] * PLACEMENT_POINTS[2];
             roundPoints[pid] = cumulativePoints[pid] - roundBaselinePoints[pid];
         }
-        roundGameIndex = rankedGames - roundBaselineRankedGames;
-        updatePlacementDisplay();
-        updateScoresChart();
+
+        // Calculate the authoritative index
+        const serverIndex = rankedGames - roundBaselineRankedGames;
+
+        // Only push to the chart if the server index is ahead of our local index
+        // or if it's identical (which will just update the existing point via dedup)
+        // If the server index is unexpectedly behind, do NOT push backwards points!
+        if (serverIndex >= originalIndex) {
+            roundGameIndex = serverIndex;
+            updatePlacementDisplay();
+            updateScoresChart();
+        } else {
+            updatePlacementDisplay();
+        }
     }
 
     // ---- ELO Rating System ----
@@ -598,71 +680,10 @@
 
     /**
      * Derive approximate ELO ratings from cumulative placement data.
-     * Since we don't have individual game results in history, we estimate
-     * from aggregate placement proportions.
+     * (Removed: We now rely exclusively on authoritative league_elo broadcasts from the server to prevent desyncs)
      */
     function replayEloFromPlacements(placements, totalRanked) {
-        if (totalRanked <= 0) return;
-
-        // Skip if we've already processed this exact ranked_games count
-        if (totalRanked === lastEloRankedGames) return;
-        lastEloRankedGames = totalRanked;
-
-        // Calculate win rates per player from placements
-        // Player with more 1st-place finishes should have higher ELO
-        const rates = {};
-        for (let pid = 1; pid <= 3; pid++) {
-            const counts = placements[String(pid)] || [0, 0, 0];
-            // Score: 1st=1.0, 2nd=0.5, 3rd=0.0 (analogous to chess)
-            rates[pid] = (counts[0] * 1.0 + counts[1] * 0.5 + counts[2] * 0.0) / totalRanked;
-        }
-
-        // Compute pairwise performance and derive ELO differences
-        const pids = [1, 2, 3];
-        for (let i = 0; i < pids.length; i++) {
-            for (let j = i + 1; j < pids.length; j++) {
-                const pidA = pids[i];
-                const pidB = pids[j];
-                // Estimate pairwise result from placement rates
-                const pA = rates[pidA];
-                const pB = rates[pidB];
-                const totalP = pA + pB;
-                if (totalP <= 0) continue;
-                const scoreA = pA / totalP; // A's pairwise win rate vs B
-                const eA = expectedScore(eloRatings[pidA], eloRatings[pidB]);
-                const eB = 1 - eA;
-                const scoreB = 1 - scoreA;
-                eloRatings[pidA] += ELO_K * (scoreA - eA);
-                eloRatings[pidB] += ELO_K * (scoreB - eB);
-            }
-        }
-
-        // Floor at 100
-        for (const p of pids) {
-            eloRatings[p] = Math.max(100, eloRatings[p]);
-        }
-
-        // Push to history (dedup: update last point if same X-value)
-        const lastLabel = eloHistory.labels.length > 0 ? eloHistory.labels[eloHistory.labels.length - 1] : -1;
-        if (lastLabel === totalRanked) {
-            // Same X-value: update in-place
-            eloHistory.red[eloHistory.red.length - 1] = Math.round(eloRatings[1]);
-            eloHistory.green[eloHistory.green.length - 1] = Math.round(eloRatings[2]);
-            eloHistory.blue[eloHistory.blue.length - 1] = Math.round(eloRatings[3]);
-        } else {
-            // New X-value: push new point
-            eloHistory.labels.push(totalRanked);
-            eloHistory.red.push(Math.round(eloRatings[1]));
-            eloHistory.green.push(Math.round(eloRatings[2]));
-            eloHistory.blue.push(Math.round(eloRatings[3]));
-
-            if (eloHistory.labels.length > MAX_ELO_POINTS) {
-                eloHistory.labels.shift();
-                eloHistory.red.shift();
-                eloHistory.green.shift();
-                eloHistory.blue.shift();
-            }
-        }
+        // Obsolete
     }
 
     function expectedScore(ratingA, ratingB) {
@@ -738,21 +759,21 @@
     }
 
     function updateScoresChart() {
-        const gameNum = roundGameIndex;
+        const roundNum = totalRounds;
         const lastLabel = scoreHistory.labels.length > 0 ? scoreHistory.labels[scoreHistory.labels.length - 1] : -1;
-        // Chart shows points within current round (roundPoints resets each round)
-        const redY = roundPoints[1];
-        const greenY = roundPoints[2];
-        const blueY = roundPoints[3];
+        // Chart shows overall cumulative points across all rounds
+        const redY = cumulativePoints[1];
+        const greenY = cumulativePoints[2];
+        const blueY = cumulativePoints[3];
 
-        if (lastLabel === gameNum) {
+        if (roundNum === lastLabel) {
             // Same X-value: update last point in-place (dedup)
             scoreHistory.red[scoreHistory.red.length - 1] = redY;
             scoreHistory.green[scoreHistory.green.length - 1] = greenY;
             scoreHistory.blue[scoreHistory.blue.length - 1] = blueY;
-        } else {
+        } else if (roundNum > lastLabel) {
             // New X-value: push new point
-            scoreHistory.labels.push(gameNum);
+            scoreHistory.labels.push(roundNum);
             scoreHistory.red.push(redY);
             scoreHistory.green.push(greenY);
             scoreHistory.blue.push(blueY);
@@ -765,6 +786,7 @@
                 scoreHistory.blue.shift();
             }
         }
+        // If roundNum < lastLabel, do nothing (we don't want to draw backwards)
 
         if (scoresChart) {
             scoresChart.data.labels = [...scoreHistory.labels];
@@ -814,7 +836,7 @@
 
         if (!hasStones) {
             // Empty board - show center region
-            minR = 45; maxR = 55; minC = 45; maxC = 55;
+            minR = 40; maxR = 60; minC = 40; maxC = 60;
         }
 
         // Add padding
@@ -963,6 +985,7 @@
                     { label: 'Reward', data: [], borderColor: '#6bff6b', borderWidth: 1.5, pointRadius: 0, tension: 0.3, hidden: true },
                     { label: 'Policy', data: [], borderColor: '#6bb5ff', borderWidth: 1.5, pointRadius: 0, tension: 0.3, hidden: true },
                     { label: 'Focus', data: [], borderColor: '#f1c40f', borderWidth: 1.5, pointRadius: 0, tension: 0.3, hidden: false },
+                    { label: 'Recon', data: [], borderColor: '#e84393', borderWidth: 1.5, pointRadius: 0, tension: 0.3, hidden: false },
                 ],
             },
             options: {
@@ -1006,7 +1029,7 @@
                 scales: {
                     x: {
                         ...commonOptions.scales.x,
-                        title: { display: true, text: '局数（每回合最多5局）', color: '#8a8aaa', font: { size: 9 } },
+                        title: { display: true, text: '回合数', color: '#8a8aaa', font: { size: 9 } },
                     },
                     y: {
                         ...commonOptions.scales.y,
@@ -1117,6 +1140,7 @@
         lossChart.data.datasets[2].data.push(metrics.loss_reward);
         lossChart.data.datasets[3].data.push(metrics.loss_policy);
         lossChart.data.datasets[4].data.push(metrics.loss_focus);
+        lossChart.data.datasets[5].data.push(metrics.loss_recon || 0.0);
 
         // Keep max 200 points
         if (lossChart.data.labels.length > 200) {
@@ -1125,7 +1149,7 @@
         }
         lossChart.update('none');
 
-        document.getElementById('current-loss').textContent = `Loss: ${metrics.loss.toFixed(4)} | F: ${metrics.loss_focus.toFixed(4)}`;
+        document.getElementById('current-loss').textContent = `Loss: ${metrics.loss.toFixed(4)} | F: ${metrics.loss_focus.toFixed(4)} | Rec: ${(metrics.loss_recon || 0.0).toFixed(4)}`;
     }
 
     function updateStatsChart(metrics) {

@@ -23,7 +23,7 @@ def test_value_target_terminal_within_td_steps():
     game.placement_rewards = {1: 1.0, 2: -0.2, 3: -1.0}
     # Minimal: we only need len(game)=3, last index 2 is terminal
     for _ in range(3):
-        game.observations.append(np.zeros((4, 21, 21), dtype=np.float32))
+
         game.actions.append(0)
         game.rewards.append(0.0)
         game.policy_targets.append(np.ones(441) / 441)
@@ -53,7 +53,7 @@ def test_value_target_bootstrap_rotation():
     # 5 steps so bootstrap_idx = 0+2 = 2 exists
     for i in range(5):
         game.player_ids.append((i % 3) + 1)
-        game.observations.append(np.zeros((4, 21, 21), dtype=np.float32))
+
         game.actions.append(0)
         game.rewards.append(0.0)
         game.policy_targets.append(np.ones(441) / 441)
@@ -166,7 +166,7 @@ def test_player_rotation_hand_computed():
     game.player_ids = [1, 2]  # pos 0 -> 1, bootstrap at 1 -> 2
     game.root_values = [np.zeros(3), np.array([1.0, 2.0, 3.0], dtype=np.float32)]
     for _ in range(2):
-        game.observations.append(np.zeros((4, 21, 21), dtype=np.float32))
+
         game.actions.append(0)
         game.rewards.append(0.0)
         game.policy_targets.append(np.ones(441) / 441)
@@ -187,7 +187,7 @@ def test_value_target_in_reasonable_range():
     game.player_ids = [1, 2, 3]
     game.placement_rewards = {1: 1.0, 2: -0.2, 3: -1.0}
     for _ in range(3):
-        game.observations.append(np.zeros((4, 21, 21), dtype=np.float32))
+
         game.actions.append(0)
         game.rewards.append(0.0)
         game.policy_targets.append(np.ones(441) / 441)
@@ -207,7 +207,7 @@ def test_mcts_action_probs_sum_and_root_value_shape():
     from ai.muzero_network import MuZeroNetwork
 
     config = MuZeroConfig()
-    config.num_simulations = 2
+    config.num_simulations_start = config.num_simulations_end = 2
     config.device = 'cpu'
     config.board_size = 15
     config.win_length = 5

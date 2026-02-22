@@ -28,7 +28,7 @@ def test_curriculum_stage(stage, expected_size, expected_win):
     config = MuZeroConfig()
     config.board_size = expected_size
     config.win_length = expected_win
-    config.num_simulations = 2 # minimal checks
+    config.num_simulations_start = config.num_simulations_end = 2 # minimal checks
     config.device = 'cpu'
 
     # 2. Env
